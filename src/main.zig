@@ -232,8 +232,12 @@ fn handleWriteStream(app: *const App, handle: u32, request_id: u32, state: *Audi
 
     const written = app.audio.audioWrite(request.stream_id, data);
     if (written < 0) {
-        state.backend_fail +%= 1;
-        copyFixed(state.last_error[0..], "write-failed");
+        if (written == r4os.abi.service_api_result_busy) {
+            copyFixed(state.last_error[0..], "write-busy");
+        } else {
+            state.backend_fail +%= 1;
+            copyFixed(state.last_error[0..], "write-failed");
+        }
         return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_write_stream, written, request.stream_id, 0, request_start);
     }
 
