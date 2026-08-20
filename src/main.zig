@@ -102,7 +102,7 @@ fn runService(app: *const App) i32 {
         }
         if (poll > 0) {
             const rc = handleRequest(app, handle, &state);
-            if (rc < 0) {
+            if (rc < 0 and rc != r4os.abi.service_api_result_not_found) {
                 closeOpenSessions(app, &state);
                 _ = app.sys.serviceEndpointUnregister(handle);
                 return rc;
@@ -209,7 +209,14 @@ fn handleOpenStream(app: *const App, handle: u32, request_id: u32, client_id: u3
     state.backend_ok +%= 1;
     copyFixed(state.last_error[0..], "stream-open");
     bumpRevision(state);
-    return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_open_stream, stream, stream_id, 0, request_start);
+    const reply = replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_open_stream, stream, stream_id, 0, request_start);
+    if (reply < 0) {
+        _ = app.audio.audioClose(stream_id);
+        state.sessions[slot] = .{};
+        copyFixed(state.last_error[0..], "open-abandoned");
+        bumpRevision(state);
+    }
+    return reply;
 }
 
 fn handleWriteStream(app: *const App, handle: u32, request_id: u32, state: *AudioServiceState, payload: []const u8, request_start: u64) i32 {
