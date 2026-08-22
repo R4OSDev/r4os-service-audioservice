@@ -93,24 +93,27 @@ fn runService(app: *const App) i32 {
     var state = AudioServiceState{};
     copyFixed(state.last_error[0..], "ready");
 
-    while (!app.sys.programShouldClose()) {
-        const poll = app.sys.serviceEndpointPoll(handle);
-        if (poll < 0) {
-            closeOpenSessions(app, &state);
-            _ = app.sys.serviceEndpointUnregister(handle);
-            return poll;
-        }
-        if (poll > 0) {
-            const rc = handleRequest(app, handle, &state);
-            if (rc < 0 and rc != r4os.abi.service_api_result_not_found) {
+    var service_loop = r4os.ServiceLoop.init(app.sys, handle, .{});
+    while (true) {
+        switch (service_loop.wait(null)) {
+            .requests => |pending| {
+                const rc = service_loop.drain(pending, handleRequest, .{ app, handle, &state });
+                if (rc >= 0 or rc == r4os.abi.service_api_result_not_found) continue;
                 closeOpenSessions(app, &state);
                 _ = app.sys.serviceEndpointUnregister(handle);
                 return rc;
-            }
+            },
+            .idle, .deadline => {},
+            .stop => break,
+            .failure => |raw| {
+                closeOpenSessions(app, &state);
+                _ = app.sys.serviceEndpointUnregister(handle);
+                return raw;
+            },
         }
-        app.sys.sleepTicks(1);
     }
 
+    service_loop.report(service_name);
     closeOpenSessions(app, &state);
     _ = app.sys.serviceEndpointUnregister(handle);
     app.sys.println("AUDSVC stopped cleanly");
