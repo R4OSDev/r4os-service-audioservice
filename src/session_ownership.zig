@@ -16,6 +16,13 @@ pub fn runningRecordMatches(client_id: u32, record_client_id: u32, record_state:
     return client_id != 0 and client_id == record_client_id and record_state == running_state;
 }
 
+pub fn isSilence(data: []const u8) bool {
+    for (data) |sample_byte| {
+        if (sample_byte != 0) return false;
+    }
+    return true;
+}
+
 test "stream access requires both client and stream identity" {
     try std.testing.expect(matches(17, 42, 17, 42));
     try std.testing.expect(!matches(17, 42, 18, 42));
@@ -30,4 +37,12 @@ test "dead clients are distinguishable from running clients" {
     try std.testing.expect(!clientIsRunning(0, running[0..]));
     try std.testing.expect(runningRecordMatches(8, 8, 0, 0));
     try std.testing.expect(!runningRecordMatches(8, 8, 1, 0));
+}
+
+test "s16le silence is detected without manufacturing payload" {
+    const silence = [_]u8{0} ** 16;
+    var signal = silence;
+    signal[9] = 1;
+    try std.testing.expect(isSilence(silence[0..]));
+    try std.testing.expect(!isSilence(signal[0..]));
 }

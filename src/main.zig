@@ -33,6 +33,7 @@ const Session = struct {
     open: bool = false,
     client_id: u32 = 0,
     stream_id: u32 = 0,
+    backend_stream_id: u32 = 0,
     rate: u32 = 0,
     channels: u16 = 0,
     format: u16 = 0,
@@ -43,6 +44,7 @@ const Session = struct {
 
 const AudioServiceState = struct {
     sessions: [max_sessions]Session = .{Session{}} ** max_sessions,
+    next_stream_id: u32 = 1,
     revision: u32 = 1,
     master_volume_fixed: u32 = default_volume,
     requests: u64 = 0,
@@ -63,6 +65,10 @@ const AudioServiceState = struct {
     write_request_max_ticks: u64 = 0,
     write_request_last_ticks: u64 = 0,
     last_write_bytes: u32 = 0,
+    lazy_open_count: u32 = 0,
+    silence_write_count: u64 = 0,
+    silence_bytes: u64 = 0,
+    idle_close_count: u64 = 0,
     peak_sessions: u32 = 0,
     backend_present: bool = false,
     last_error: [r4os.abi.audio_service_error_bytes]u8 = .{0} ** r4os.abi.audio_service_error_bytes,
@@ -180,7 +186,8 @@ fn handleSetMasterVolume(app: *const App, handle: u32, request_id: u32, state: *
     var i: usize = 0;
     while (i < state.sessions.len) : (i += 1) {
         if (!state.sessions[i].open) continue;
-        const rc = app.audio.audioSetVolume(state.sessions[i].stream_id, effectiveVolume(state, state.sessions[i].fixed_volume));
+        if (state.sessions[i].backend_stream_id == 0) continue;
+        const rc = app.audio.audioSetVolume(state.sessions[i].backend_stream_id, effectiveVolume(state, state.sessions[i].fixed_volume));
         if (rc >= 0) {
             state.backend_ok +%= 1;
         } else {
@@ -194,10 +201,9 @@ fn handleSetMasterVolume(app: *const App, handle: u32, request_id: u32, state: *
 fn handleOpenStream(app: *const App, handle: u32, request_id: u32, client_id: u32, state: *AudioServiceState, payload: []const u8, request_start: u64) i32 {
     var request: r4os.abi.AudioServiceStreamOpenRequest = .{};
     state.stream_open_requests +%= 1;
-    refreshBackendState(app, state);
-    if (client_id == 0 or !state.backend_present) {
-        copyFixed(state.last_error[0..], if (client_id == 0) "bad-client" else "no-backend");
-        return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_open_stream, if (client_id == 0) r4os.abi.service_api_result_invalid else r4os.abi.service_api_result_no_endpoint, 0, 0, request_start);
+    if (client_id == 0) {
+        copyFixed(state.last_error[0..], "bad-client");
+        return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_open_stream, r4os.abi.service_api_result_invalid, 0, 0, request_start);
     }
     if (!parseOpenRequest(payload, &request)) {
         copyFixed(state.last_error[0..], "bad-open");
@@ -212,21 +218,10 @@ fn handleOpenStream(app: *const App, handle: u32, request_id: u32, client_id: u3
         return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_open_stream, r4os.abi.service_api_result_full, 0, 0, request_start);
     };
 
-    const stream = app.audio.audioOpenStream(request.rate, request.channels, .s16le);
-    if (stream < 0) {
-        state.backend_fail +%= 1;
-        copyFixed(state.last_error[0..], "open-failed");
-        return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_open_stream, stream, 0, 0, request_start);
-    }
-
-    const stream_id: u32 = @intCast(stream);
-    const volume_result = app.audio.audioSetVolume(stream_id, scaleVolume(request.fixed_volume, state.master_volume_fixed));
-    if (volume_result < 0) {
-        _ = app.audio.audioClose(stream_id);
-        state.backend_fail +%= 1;
-        copyFixed(state.last_error[0..], "volume-failed");
-        return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_open_stream, volume_result, 0, 0, request_start);
-    }
+    const stream_id = allocateStreamId(state) orelse {
+        copyFixed(state.last_error[0..], "id-full");
+        return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_open_stream, r4os.abi.service_api_result_full, 0, 0, request_start);
+    };
     state.sessions[slot] = .{
         .open = true,
         .client_id = client_id,
@@ -237,12 +232,10 @@ fn handleOpenStream(app: *const App, handle: u32, request_id: u32, client_id: u3
         .fixed_volume = request.fixed_volume,
     };
     updatePeak(state);
-    state.backend_ok +%= 1;
-    copyFixed(state.last_error[0..], "stream-open");
+    copyFixed(state.last_error[0..], "stream-lazy");
     bumpRevision(state);
-    const reply = replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_open_stream, stream, stream_id, 0, request_start);
+    const reply = replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_open_stream, @intCast(stream_id), stream_id, 0, request_start);
     if (reply < 0) {
-        _ = app.audio.audioClose(stream_id);
         state.sessions[slot] = .{};
         copyFixed(state.last_error[0..], "open-abandoned");
         bumpRevision(state);
@@ -268,7 +261,35 @@ fn handleWriteStream(app: *const App, handle: u32, request_id: u32, client_id: u
         return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_write_stream, -1, request.stream_id, 0, request_start);
     };
 
-    const written = app.audio.audioWrite(request.stream_id, data);
+    if (session_ownership.isSilence(data)) {
+        state.silence_write_count +%= 1;
+        state.silence_bytes +%= @as(u64, @intCast(data.len));
+        state.last_write_bytes = 0;
+        if (session.backend_stream_id != 0) {
+            const idle_close = app.audio.audioClose(session.backend_stream_id);
+            if (idle_close >= 0) {
+                session.backend_stream_id = 0;
+                state.idle_close_count +%= 1;
+                state.backend_ok +%= 1;
+                bumpRevision(state);
+                copyFixed(state.last_error[0..], "stream-idle");
+            } else {
+                state.backend_fail +%= 1;
+                copyFixed(state.last_error[0..], "idle-close-failed");
+            }
+        } else {
+            copyFixed(state.last_error[0..], "silence-suppressed");
+        }
+        session.writes +%= 1;
+        return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_write_stream, @intCast(data.len), request.stream_id, @intCast(data.len), request_start);
+    }
+
+    const materialize = materializeSession(app, state, session);
+    if (materialize < 0) {
+        return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_write_stream, materialize, request.stream_id, 0, request_start);
+    }
+
+    const written = app.audio.audioWrite(session.backend_stream_id, data);
     if (written < 0) {
         if (written == r4os.abi.service_api_result_busy) {
             copyFixed(state.last_error[0..], "write-busy");
@@ -302,7 +323,8 @@ fn handleCloseStream(app: *const App, handle: u32, request_id: u32, client_id: u
         return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_close_stream, -1, request.stream_id, 0, request_start);
     };
 
-    const rc = app.audio.audioClose(request.stream_id);
+    const backend_stream_id = state.sessions[slot].backend_stream_id;
+    const rc = if (backend_stream_id == 0) 0 else app.audio.audioClose(backend_stream_id);
     if (rc >= 0) {
         state.sessions[slot] = .{};
         state.backend_ok +%= 1;
@@ -327,7 +349,7 @@ fn handleSetStreamVolume(app: *const App, handle: u32, request_id: u32, client_i
         return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_set_stream_volume, -1, request.stream_id, 0, request_start);
     };
     session.fixed_volume = request.fixed_volume;
-    const rc = app.audio.audioSetVolume(request.stream_id, effectiveVolume(state, request.fixed_volume));
+    const rc = if (session.backend_stream_id == 0) 0 else app.audio.audioSetVolume(session.backend_stream_id, effectiveVolume(state, request.fixed_volume));
     if (rc >= 0) {
         state.backend_ok +%= 1;
         copyFixed(state.last_error[0..], "stream-volume");
@@ -392,6 +414,11 @@ fn makeStatus(state: *const AudioServiceState) r4os.abi.AudioServiceStatus {
         .write_request_max_ticks = state.write_request_max_ticks,
         .write_request_last_ticks = state.write_request_last_ticks,
         .last_write_bytes = state.last_write_bytes,
+        .materialized_sessions = materializedSessionCount(state),
+        .lazy_open_count = state.lazy_open_count,
+        .silence_write_count = state.silence_write_count,
+        .silence_bytes = state.silence_bytes,
+        .idle_close_count = state.idle_close_count,
     };
     copyFixed(out.backend_name[0..], if (state.backend_present) "kernel-audio" else "none");
     copyFixed(out.mixer_name[0..], "SimpleKernelMixer");
@@ -440,20 +467,38 @@ fn runSelfTest(app: *const App) i32 {
     if (app.sys.audioServiceSetMasterVolume(0x0000_8000, &status) != r4os.abi.service_api_result_ok) return fail(&app.sys, "master-volume");
     if (status.master_volume_fixed != 0x0000_8000) return fail(&app.sys, "master-status");
 
+    const baseline_materialized = status.materialized_sessions;
+    const baseline_lazy_opens = status.lazy_open_count;
+    const baseline_silence_writes = status.silence_write_count;
+    const baseline_idle_closes = status.idle_close_count;
+    var silence: [1024]u8 = .{0} ** 1024;
     var pcm: [1024]u8 = undefined;
     fillSquare(pcm[0..]);
     const stream = app.sys.audioServiceOpenStream(48_000, 2, .s16le);
     if (stream < 0) return fail(&app.sys, "stream-open");
     const stream_id: u32 = @intCast(stream);
     const volume = app.sys.audioServiceSetVolume(stream_id, default_volume);
+    const silent_written = app.sys.audioServiceWrite(stream_id, silence[0..]);
+    if (volume < 0 or silent_written != @as(i32, @intCast(silence.len))) return fail(&app.sys, "stream-lazy-silence");
+    if (app.sys.audioServiceStatus(&status) != r4os.abi.service_api_result_ok) return fail(&app.sys, "silence-status");
+    if (status.materialized_sessions != baseline_materialized or status.lazy_open_count != baseline_lazy_opens) return fail(&app.sys, "silence-materialized");
+    if (status.silence_write_count <= baseline_silence_writes or status.silence_bytes < silence.len) return fail(&app.sys, "silence-metrics");
+
     const written = app.sys.audioServiceWrite(stream_id, pcm[0..]);
-    const closed = app.sys.audioServiceClose(stream_id);
-    if (volume < 0 or written != @as(i32, @intCast(pcm.len)) or closed != 0) return fail(&app.sys, "stream-cycle");
+    if (written != @as(i32, @intCast(pcm.len))) return fail(&app.sys, "stream-signal");
     if (app.sys.audioServiceStatus(&status) != r4os.abi.service_api_result_ok) return fail(&app.sys, "latency-status");
     const expected_written: u32 = @intCast(pcm.len);
     if (status.stream_write_requests == 0 or status.bytes_written < expected_written or status.last_write_bytes == 0 or status.last_write_bytes > expected_written) return fail(&app.sys, "latency-write-status");
+    if (status.materialized_sessions <= baseline_materialized or status.lazy_open_count <= baseline_lazy_opens) return fail(&app.sys, "lazy-materialize");
     if (status.request_max_ticks < status.request_last_ticks or status.request_total_ticks < status.request_last_ticks) return fail(&app.sys, "latency-request-ticks");
     if (status.write_request_max_ticks < status.write_request_last_ticks or status.write_request_total_ticks < status.write_request_last_ticks) return fail(&app.sys, "latency-write-ticks");
+
+    const idle_written = app.sys.audioServiceWrite(stream_id, silence[0..]);
+    if (idle_written != @as(i32, @intCast(silence.len))) return fail(&app.sys, "idle-write");
+    if (app.sys.audioServiceStatus(&status) != r4os.abi.service_api_result_ok) return fail(&app.sys, "idle-status");
+    if (status.materialized_sessions != baseline_materialized or status.idle_close_count <= baseline_idle_closes) return fail(&app.sys, "idle-close");
+    const closed = app.sys.audioServiceClose(stream_id);
+    if (closed != 0) return fail(&app.sys, "stream-close");
 
     const leaky = app.sys.audioServiceOpenStream(48_000, 2, .s16le);
     if (leaky < 0) return fail(&app.sys, "restart-open");
@@ -561,7 +606,7 @@ fn closeOpenSessions(app: *const App, state: *AudioServiceState) void {
     var i: usize = 0;
     while (i < state.sessions.len) : (i += 1) {
         if (!state.sessions[i].open) continue;
-        _ = app.audio.audioClose(state.sessions[i].stream_id);
+        if (state.sessions[i].backend_stream_id != 0) _ = app.audio.audioClose(state.sessions[i].backend_stream_id);
         state.sessions[i] = .{};
     }
     bumpRevision(state);
@@ -573,6 +618,54 @@ fn freeSession(state: *const AudioServiceState) ?usize {
         if (!state.sessions[i].open) return i;
     }
     return null;
+}
+
+fn allocateStreamId(state: *AudioServiceState) ?u32 {
+    var attempts: usize = 0;
+    while (attempts <= state.sessions.len) : (attempts += 1) {
+        const candidate = state.next_stream_id;
+        state.next_stream_id +%= 1;
+        if (state.next_stream_id == 0) state.next_stream_id = 1;
+        if (candidate != 0 and sessionSlotById(state, candidate) == null) return candidate;
+    }
+    return null;
+}
+
+fn sessionSlotById(state: *const AudioServiceState, stream_id: u32) ?usize {
+    var i: usize = 0;
+    while (i < state.sessions.len) : (i += 1) {
+        if (state.sessions[i].open and state.sessions[i].stream_id == stream_id) return i;
+    }
+    return null;
+}
+
+fn materializeSession(app: *const App, state: *AudioServiceState, session: *Session) i32 {
+    if (session.backend_stream_id != 0) return 0;
+    refreshBackendState(app, state);
+    if (!state.backend_present) {
+        copyFixed(state.last_error[0..], "no-backend");
+        return r4os.abi.service_api_result_no_endpoint;
+    }
+    const stream = app.audio.audioOpenStream(session.rate, session.channels, .s16le);
+    if (stream < 0) {
+        state.backend_fail +%= 1;
+        copyFixed(state.last_error[0..], "open-failed");
+        return stream;
+    }
+    const backend_stream_id: u32 = @intCast(stream);
+    const volume_result = app.audio.audioSetVolume(backend_stream_id, effectiveVolume(state, session.fixed_volume));
+    if (volume_result < 0) {
+        _ = app.audio.audioClose(backend_stream_id);
+        state.backend_fail +%= 1;
+        copyFixed(state.last_error[0..], "volume-failed");
+        return volume_result;
+    }
+    session.backend_stream_id = backend_stream_id;
+    state.lazy_open_count +%= 1;
+    state.backend_ok +%= 1;
+    copyFixed(state.last_error[0..], "stream-materialized");
+    bumpRevision(state);
+    return 0;
 }
 
 fn sessionByStream(state: *AudioServiceState, client_id: u32, stream_id: u32) ?*Session {
@@ -606,7 +699,7 @@ fn reapDisconnectedSessions(app: *const App, state: *AudioServiceState) void {
     while (i < state.sessions.len) : (i += 1) {
         const session = &state.sessions[i];
         if (!session.open or clientIsRunning(&app.sys, session.client_id)) continue;
-        const rc = app.audio.audioClose(session.stream_id);
+        const rc = if (session.backend_stream_id == 0) 0 else app.audio.audioClose(session.backend_stream_id);
         if (rc < 0) {
             state.backend_fail +%= 1;
             copyFixed(state.last_error[0..], "reap-failed");
@@ -637,6 +730,14 @@ fn openSessionCount(state: *const AudioServiceState) u32 {
     var i: usize = 0;
     while (i < state.sessions.len) : (i += 1) {
         if (state.sessions[i].open) count += 1;
+    }
+    return count;
+}
+
+fn materializedSessionCount(state: *const AudioServiceState) u32 {
+    var count: u32 = 0;
+    for (state.sessions) |session| {
+        if (session.open and session.backend_stream_id != 0) count += 1;
     }
     return count;
 }

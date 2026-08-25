@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.4`
+- Version: `0.1.6`
 - Image target: `/R4OS/SERVICES/AUDSVC.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -29,9 +29,14 @@ mapped local checkouts.
 
 ## Documentation
 
-Detailed German technical notes from the migration are preserved in
-`DOCUMENTATION.de.txt`. Source-transfer provenance is recorded in
-`PROVENANCE.txt`.
+Open creates a client-bound logical stream. The backend stream is materialized
+only by the first non-silent PCM block. Complete zero blocks are acknowledged
+without a backend payload and close an active backend once; later signal may
+materialize it again. Status version 2 exposes logical/materialized sessions,
+lazy opens, suppressed silence and idle closes in the existing fixed record.
+
+Detailed German technical notes are in `DOCUMENTATION.de.txt`.
+Source-transfer provenance is recorded in `PROVENANCE.txt`.
 
 ## License
 
