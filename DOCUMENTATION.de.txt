@@ -1,4 +1,4 @@
-﻿AUDSVC.R4X 0.1.6
+﻿AUDSVC.R4X 0.1.7
 =================
 
 AUDSVC ist der clientgebundene Audio- und Mixer-Service zwischen der
@@ -36,6 +36,30 @@ Write-/Bytezaehler, Latenzen und Fehler bleiben getrennt. Nur produktiv an das
 Backend uebergebene Bytes erhoehen `bytes_written`; unterdrueckte Stille besitzt
 eigene Zaehler.
 
+Masterlautstaerke, Mute und Persistenz
+--------------------------------------
+
+Die append-only Operationen `MASTER_STATUS` und `SET_MASTER_STATE` liefern
+beziehungsweise aendern den kanonischen globalen Masterzustand. Ausgewaehlter
+Gain, effektiver Gain, explizites Mute, letzte hoerbare Lautstaerke,
+Service-Epoche und Masterrevision sind gemeinsam beobachtbar. Der alte
+`SET_MASTER_VOLUME`-Aufruf bleibt kompatibel und veraendert Mute nicht; eine
+positive Lautstaerke ueber den neuen Aufruf entstummt dagegen bewusst.
+
+Mute setzt den effektiven unsigned-16.16-Gain aller materialisierten Streams
+auf null, ohne Streamlautstaerken oder den ausgewaehlten Masterwert zu
+veraendern. Eine Masteraenderung wird genau einmal auf jeden aktiven
+Backendstream aufgefaechert. Sie erzeugt weder einen zweiten Mixer noch neue
+Streams.
+
+Der Service speichert `C:\R4OS\CONFIG\AUDIO.R4S` ueber den atomischen
+R4SYS-Ersetzungspfad mit Stage, Backup und Ruecklesepruefung. Aenderungen
+werden 500 ms entprellt und sicher ersetzt. Fehlende oder
+ungueltige Konfiguration verwendet belastbare Standardwerte; die naechste
+Masteraenderung schreibt wieder ein gueltiges Dokument. Ein Schreibfehler
+bleibt im Status sichtbar, beendet aber weder den Dienst noch den wirksamen
+Laufzeitzustand.
+
 Build und Tests
 ---------------
 
@@ -49,3 +73,6 @@ Unter Linux:
 
 Der Testschritt baut und inspiziert AUDSVC.R4X und prueft Client-/Streambesitz,
 Stilleerkennung sowie den Lazy-Silence-/Signal-/Idle-Close-Selbsttestpfad.
+Der integrierte Gast-Selbsttest belegt ausserdem Mute-Kompatibilitaet,
+gemeinsame Masterauffaecherung auf zwei Streams und Persistenz ueber einen
+Dienstneustart; danach stellt er den urspruenglichen Masterzustand wieder her.

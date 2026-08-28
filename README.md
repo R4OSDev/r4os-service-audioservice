@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.6`
+- Version: `0.1.7`
 - Image target: `/R4OS/SERVICES/AUDSVC.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -34,6 +34,12 @@ only by the first non-silent PCM block. Complete zero blocks are acknowledged
 without a backend payload and close an active backend once; later signal may
 materialize it again. Status version 2 exposes logical/materialized sessions,
 lazy opens, suppressed silence and idle closes in the existing fixed record.
+
+Append-only master-state operations expose the selected and effective 16.16
+gain, explicit mute, the last audible value, revision, service epoch and
+persistence diagnostics. AUDSVC owns this global state and safely persists it
+to `C:\R4OS\CONFIG\AUDIO.R4S`; clients do not maintain a second mixer state.
+The legacy set-volume operation remains compatible and never changes mute.
 
 Detailed German technical notes are in `DOCUMENTATION.de.txt`.
 Source-transfer provenance is recorded in `PROVENANCE.txt`.

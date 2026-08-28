@@ -19,7 +19,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_ownership_tests = b.addRunArtifact(ownership_tests);
+    const master_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/master_control.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const run_master_tests = b.addRunArtifact(master_tests);
     const test_step = b.step("test", "Build AudioService and run session ownership tests");
     test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_ownership_tests.step);
+    test_step.dependOn(&run_master_tests.step);
 }
