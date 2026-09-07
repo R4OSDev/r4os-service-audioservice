@@ -1,4 +1,4 @@
-﻿AUDSVC.R4X 0.1.7
+﻿AUDSVC.R4X 0.1.8
 =================
 
 AUDSVC ist der clientgebundene Audio- und Mixer-Service zwischen der
@@ -10,7 +10,7 @@ Streambesitz und Lazy-Lebenszyklus
 ----------------------------------
 
 Open reserviert einen logischen Stream in der festen 16-Slot-Servicetabelle,
-bindet ihn an die aufrufende Programminstanz und vergibt eine eigene
+bindet ihn an ID und Generation der aufrufenden Programminstanz und vergibt eine eigene
 generationsfreie, nicht mit Kernelhandles vermischte ID. Es oeffnet noch
 keinen Kernel-/Treiberstream. Erst der erste PCM-Block mit mindestens einem
 von null verschiedenen Byte materialisiert das Backend und wendet die
@@ -24,6 +24,14 @@ erneut. SetVolume aktualisiert einen noch nicht materialisierten Stream ohne
 Backendaufruf. Close, Client-Reap, Dienstneustart und Shutdown schliessen nur
 tatsaechlich vorhandene Backendhandles und leeren den logischen Slot
 idempotent.
+
+Pro Reap-Runde wird das Programminventar hoechstens einmal seitenweise
+abgefragt; alle 16 Slots teilen diesen Durchlauf. Je Seite werden hoechstens
+16 Records in festen Puffern gelesen. Unvollstaendige oder zwischenzeitlich
+geaenderte Inventare erlauben kein Schliessen vermeintlich fehlender Clients.
+Eine wiederverwendete Programm-ID mit neuer Generation erhaelt alte Streams
+nicht am Leben. Open bindet die Generation ueber dasselbe bestehende
+Inventar-API; bei einem unvollstaendigen Snapshot meldet es Busy.
 
 Status und Fehler
 -----------------
@@ -71,8 +79,9 @@ Unter Linux:
 
     ./Build.sh test
 
-Der Testschritt baut und inspiziert AUDSVC.R4X und prueft Client-/Streambesitz,
-Stilleerkennung sowie den Lazy-Silence-/Signal-/Idle-Close-Selbsttestpfad.
+Der Host-Testschritt baut und inspiziert AUDSVC.R4X und prueft Client-/Streambesitz,
+Stilleerkennung, gebuendelte Inventarabfragen und generationsgebundenen Reap.
+Lazy-Silence, Signal und Idle-Close werden im gezielten Gast-Selbsttest geprueft.
 Der integrierte Gast-Selbsttest belegt ausserdem Mute-Kompatibilitaet,
 gemeinsame Masterauffaecherung auf zwei Streams und Persistenz ueber einen
 Dienstneustart; danach stellt er den urspruenglichen Masterzustand wieder her.

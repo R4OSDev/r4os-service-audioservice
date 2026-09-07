@@ -43,6 +43,7 @@ const App = struct {
 const Session = struct {
     open: bool = false,
     client_id: u32 = 0,
+    client_generation: u64 = 0,
     stream_id: u32 = 0,
     backend_stream_id: u32 = 0,
     rate: u32 = 0,
@@ -291,6 +292,13 @@ fn handleOpenStream(app: *const App, handle: u32, request_id: u32, client_id: u3
         return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_open_stream, r4os.abi.service_api_result_full, 0, 0, request_start);
     };
 
+    var reader = ClientInventory{ .ctx = &app.sys };
+    var generation: [1]u64 = undefined;
+    if (!session_ownership.collectRunning(&.{.{ .id = client_id, .generation = 0 }}, &generation, &reader) or generation[0] == 0) {
+        copyFixed(state.last_error[0..], "client-snapshot-busy");
+        return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_open_stream, r4os.abi.service_api_result_busy, 0, 0, request_start);
+    }
+
     const stream_id = allocateStreamId(state) orelse {
         copyFixed(state.last_error[0..], "id-full");
         return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_open_stream, r4os.abi.service_api_result_full, 0, 0, request_start);
@@ -298,6 +306,7 @@ fn handleOpenStream(app: *const App, handle: u32, request_id: u32, client_id: u3
     state.sessions[slot] = .{
         .open = true,
         .client_id = client_id,
+        .client_generation = generation[0],
         .stream_id = stream_id,
         .rate = request.rate,
         .channels = request.channels,
@@ -321,7 +330,9 @@ fn handleWriteStream(app: *const App, handle: u32, request_id: u32, client_id: u
     state.stream_write_requests +%= 1;
     const header_size = @sizeOf(r4os.abi.AudioServiceStreamWriteRequest);
     if (payload.len < header_size or !parseWriteRequest(payload[0..header_size], &request)) {
-        copyFixed(state.last_error[0..], "bad-write");
+        var detail: [48]u8 = undefined;
+        const message = std.fmt.bufPrint(&detail, "bad-write {d}/{x}/{d}", .{ payload.len, request.magic, request.version }) catch "bad-write";
+        copyFixed(state.last_error[0..], message);
         return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_write_stream, r4os.abi.service_api_result_invalid, 0, 0, request_start);
     }
     if (request.byte_count > payload.len - header_size) {
@@ -604,7 +615,22 @@ fn runSelfTest(app: *const App) i32 {
     const stream_id: u32 = @intCast(stream);
     const volume = app.sys.audioServiceSetVolume(stream_id, default_volume);
     const silent_written = app.sys.audioServiceWrite(stream_id, silence[0..]);
-    if (volume < 0 or silent_written != @as(i32, @intCast(silence.len))) return fail(&app.sys, "stream-lazy-silence");
+    if (volume < 0 or silent_written != @as(i32, @intCast(silence.len))) {
+        app.sys.write("AUDSVC selftest stream=");
+        app.sys.printU64(stream_id);
+        app.sys.write(" volume=");
+        app.sys.printI32(volume);
+        app.sys.write(" silence=");
+        app.sys.printI32(silent_written);
+        if (app.sys.audioServiceStatus(&status) == r4os.abi.service_api_result_ok) {
+            app.sys.write(" sessions=");
+            app.sys.printU64(status.open_sessions);
+            app.sys.write(" error=");
+            app.sys.write(spanZ(status.last_error[0..]));
+        }
+        app.sys.println("");
+        return fail(&app.sys, "stream-lazy-silence");
+    }
     if (app.sys.audioServiceStatus(&status) != r4os.abi.service_api_result_ok) return fail(&app.sys, "silence-status");
     if (status.materialized_sessions != baseline_materialized or status.lazy_open_count != baseline_lazy_opens) return fail(&app.sys, "silence-materialized");
     if (status.silence_write_count <= baseline_silence_writes or status.silence_bytes < silence.len) return fail(&app.sys, "silence-metrics");
@@ -1118,11 +1144,25 @@ fn refreshBackendState(app: *const App, state: *AudioServiceState) void {
 }
 
 fn reapDisconnectedSessions(app: *const App, state: *AudioServiceState) void {
+    var owners: [max_sessions]session_ownership.Owner = undefined;
+    var generations: [max_sessions]u64 = undefined;
+    var count: usize = 0;
+    for (state.sessions) |session| {
+        if (!session.open) continue;
+        owners[count] = .{ .id = session.client_id, .generation = session.client_generation };
+        count += 1;
+    }
+    var reader = ClientInventory{ .ctx = &app.sys };
+    if (!session_ownership.collectRunning(owners[0..count], generations[0..count], &reader)) return;
     var changed = false;
+    var owner_index: usize = 0;
     var i: usize = 0;
     while (i < state.sessions.len) : (i += 1) {
         const session = &state.sessions[i];
-        if (!session.open or clientIsRunning(&app.sys, session.client_id)) continue;
+        if (!session.open) continue;
+        const running_generation = generations[owner_index];
+        owner_index += 1;
+        if (running_generation != 0) continue;
         const rc = if (session.backend_stream_id == 0) 0 else app.audio.audioClose(session.backend_stream_id);
         if (rc < 0) {
             state.backend_fail +%= 1;
@@ -1138,16 +1178,30 @@ fn reapDisconnectedSessions(app: *const App, state: *AudioServiceState) void {
     }
 }
 
-fn clientIsRunning(ctx: *const r4os.r4sys.Context, client_id: u32) bool {
-    if (client_id == 0) return false;
-    var index: u32 = 0;
-    while (true) : (index +%= 1) {
-        var info: r4os.abi.ProgramInstanceInfo = .{};
-        if (ctx.programInstance(index, &info) <= 0) return false;
-        if (session_ownership.runningRecordMatches(client_id, info.id, info.state, program_instance_state_running)) return true;
-        if (index == std.math.maxInt(u32)) return false;
+const ClientInventory = struct {
+    ctx: *const r4os.r4sys.Context,
+    cursor: r4os.abi.ProgramInventoryCursor = .{},
+    items: [16]r4os.abi.ProgramInstanceSnapshot = undefined,
+    records: [16]session_ownership.Record = undefined,
+
+    pub fn begin(self: *ClientInventory) bool {
+        var summary: r4os.abi.ProgramInventorySummary = .{};
+        return self.ctx.programInventoryBegin(&self.cursor, &summary) == r4os.abi.program_handle_ok;
     }
-}
+    pub fn next(self: *ClientInventory) ?session_ownership.Page {
+        var page: r4os.abi.ProgramInventoryPageInfo = .{};
+        if (self.ctx.programInventoryPrograms(&self.cursor, &self.items, &page) != r4os.abi.program_handle_ok or
+            page.snapshot_generation != self.cursor.snapshot_generation or page.returned > self.items.len or
+            (page.status != r4os.abi.program_inventory_status_complete and page.status != r4os.abi.program_inventory_status_more)) return null;
+        for (self.items[0..page.returned], 0..) |item, i| {
+            self.records[i] = .{
+                .owner = .{ .id = item.handle.instance_id, .generation = item.handle.generation },
+                .running = item.info.state == program_instance_state_running,
+            };
+        }
+        return .{ .records = self.records[0..page.returned], .complete = page.status == r4os.abi.program_inventory_status_complete };
+    }
+};
 
 fn openSessionCount(state: *const AudioServiceState) u32 {
     var count: u32 = 0;
