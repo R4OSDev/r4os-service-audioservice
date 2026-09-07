@@ -1,4 +1,5 @@
 const std = @import("std");
+const outputs = @import("output_policy.zig");
 
 pub const default_volume: u32 = 0x0001_0000;
 pub const schema = "AUDSVC_MASTER";
@@ -25,6 +26,7 @@ pub const Persisted = struct {
     selected_volume_fixed: u32 = default_volume,
     last_audible_volume_fixed: u32 = default_volume,
     muted: bool = false,
+    desired_output: outputs.Id = outputs.automatic,
 };
 
 /// Applies the explicit append-only master contract. A positive volume change
@@ -84,8 +86,8 @@ pub fn snapshot(state: State) Persisted {
 pub fn encode(persisted: Persisted, out: []u8) ?[]const u8 {
     return std.fmt.bufPrint(
         out,
-        "\xEF\xBB\xBFR4S_FORMAT=1\r\nSCHEMA=" ++ schema ++ "\r\nVOLUME_FIXED={d}\r\nMUTED={s}\r\nLAST_AUDIBLE_FIXED={d}\r\n",
-        .{ persisted.selected_volume_fixed, if (persisted.muted) "true" else "false", persisted.last_audible_volume_fixed },
+        "\xEF\xBB\xBFR4S_FORMAT=1\r\nSCHEMA=" ++ schema ++ "\r\nVOLUME_FIXED={d}\r\nMUTED={s}\r\nLAST_AUDIBLE_FIXED={d}\r\nOUTPUT_ID={s}\r\n",
+        .{ persisted.selected_volume_fixed, if (persisted.muted) "true" else "false", persisted.last_audible_volume_fixed, std.mem.sliceTo(&persisted.desired_output, 0) },
     ) catch null;
 }
 
@@ -95,6 +97,7 @@ pub fn parse(bytes: []const u8) ?Persisted {
     var selected: ?u32 = null;
     var muted: ?bool = null;
     var last_audible: ?u32 = null;
+    var desired_output: ?outputs.Id = null;
     var rest = if (std.mem.startsWith(u8, bytes, "\xEF\xBB\xBF")) bytes[3..] else bytes;
     while (rest.len != 0) {
         const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
@@ -121,6 +124,12 @@ pub fn parse(bytes: []const u8) ?Persisted {
         } else if (std.ascii.eqlIgnoreCase(key, "LAST_AUDIBLE_FIXED")) {
             if (last_audible != null) return null;
             last_audible = std.fmt.parseInt(u32, value, 10) catch return null;
+        } else if (std.ascii.eqlIgnoreCase(key, "OUTPUT_ID")) {
+            if (desired_output != null or value.len >= 64) return null;
+            var id = outputs.automatic;
+            @memcpy(id[0..value.len], value);
+            if (!outputs.validId(&id)) return null;
+            desired_output = id;
         }
     }
     if (format != 1 or parsed_schema == null or !std.ascii.eqlIgnoreCase(parsed_schema.?, schema)) return null;
@@ -128,6 +137,7 @@ pub fn parse(bytes: []const u8) ?Persisted {
         .selected_volume_fixed = selected orelse return null,
         .last_audible_volume_fixed = last_audible orelse return null,
         .muted = muted orelse return null,
+        .desired_output = desired_output orelse outputs.automatic,
     };
     if (value.last_audible_volume_fixed == 0) return null;
     return value;
@@ -171,10 +181,14 @@ test "legacy master volume never clears explicit mute" {
 }
 
 test "configuration round trips and rejects corrupt required fields" {
-    const expected = Persisted{ .selected_volume_fixed = 32768, .last_audible_volume_fixed = 49152, .muted = true };
+    var expected = Persisted{ .selected_volume_fixed = 32768, .last_audible_volume_fixed = 49152, .muted = true };
+    @memcpy(expected.desired_output[0..11], "HDA-example");
     var bytes: [256]u8 = undefined;
     const encoded = encode(expected, bytes[0..]) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(expected, parse(encoded).?);
+    const legacy = "R4S_FORMAT=1\r\nSCHEMA=AUDSVC_MASTER\r\nVOLUME_FIXED=32768\r\nMUTED=true\r\nLAST_AUDIBLE_FIXED=49152\r\n";
+    try std.testing.expectEqual(outputs.automatic, parse(legacy).?.desired_output);
+    try std.testing.expect(parse(legacy ++ "OUTPUT_ID=a\r\nOUTPUT_ID=b\r\n") == null);
     try std.testing.expect(parse("R4S_FORMAT=1\r\nSCHEMA=AUDSVC_MASTER\r\nMUTED=true\r\n") == null);
     try std.testing.expect(parse("R4S_FORMAT=1\r\nSCHEMA=AUDSVC_MASTER\r\nVOLUME_FIXED=x\r\nMUTED=true\r\nLAST_AUDIBLE_FIXED=1\r\n") == null);
 }

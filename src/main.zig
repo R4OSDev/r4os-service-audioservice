@@ -1,6 +1,8 @@
 const std = @import("std");
 const r4os = @import("r4os");
 const master_control = @import("master_control.zig");
+const output_policy = @import("output_policy.zig");
+const output_control = @import("output_control.zig");
 const session_ownership = @import("session_ownership.zig");
 
 const service_name = "AUDSVC";
@@ -23,6 +25,8 @@ var service_payload_buffer: [r4os.abi.service_api_max_payload]u8 = .{0xA5} ** r4
 var service_status_reply: r4os.abi.AudioServiceStatus = .{};
 var service_result_reply: r4os.abi.AudioServiceStreamResult = .{};
 var service_master_reply: r4os.abi.AudioServiceMasterState = .{};
+// The bounded catalog and scratch page belong to this service instance, not its stack.
+var service_outputs: output_control.State = .{};
 
 const App = struct {
     sys: r4os.r4sys.Context,
@@ -63,6 +67,7 @@ const PersistenceJob = struct {
     target_selected_volume_fixed: u32 = default_volume,
     target_last_audible_volume_fixed: u32 = default_volume,
     target_muted: u32 = 0,
+    target_output_words: [8]u64 = .{0} ** 8,
     completed_snapshot: master_control.Persisted = .{},
 };
 
@@ -71,6 +76,7 @@ const AudioServiceState = struct {
     next_stream_id: u32 = 1,
     revision: u32 = 1,
     master: master_control.State = .{},
+    outputs: *output_control.State = &service_outputs,
     service_epoch: u64 = 0,
     config_loaded: bool = false,
     config_defaulted: bool = false,
@@ -206,6 +212,7 @@ fn handleRequest(app: *const App, handle: u32, state: *AudioServiceState) i32 {
     const rc = switch (header.op) {
         r4os.abi.audio_service_op_status => replyStatus(app, handle, header.request_id, state, request_start),
         r4os.abi.audio_service_op_set_master_volume => handleSetMasterVolume(app, handle, header.request_id, state, payload, request_start),
+        r4os.abi.audio_service_op_outputs, r4os.abi.audio_service_op_select_output => handleOutputs(app, handle, header.request_id, state, header.op, payload, request_start),
         r4os.abi.audio_service_op_master_status => replyMasterState(app, handle, header.request_id, state, request_start),
         r4os.abi.audio_service_op_set_master_state => handleSetMasterState(app, handle, header.request_id, state, payload, request_start),
         r4os.abi.audio_service_op_open_stream => handleOpenStream(app, handle, header.request_id, header.client_id, state, payload, request_start),
@@ -220,6 +227,43 @@ fn handleRequest(app: *const App, handle: u32, state: *AudioServiceState) i32 {
         },
     };
     return rc;
+}
+
+fn configurationSnapshot(state: *const AudioServiceState) master_control.Persisted {
+    var snapshot = master_control.snapshot(state.master);
+    snapshot.desired_output = state.outputs.desired;
+    return snapshot;
+}
+
+fn refreshOutputs(app: *const App, state: *AudioServiceState, force: bool) bool {
+    return state.outputs.refresh(&app.audio, app.sys.ticks(), @max(app.sys.ticksFromMilliseconds(500), 1), force);
+}
+
+fn handleOutputs(app: *const App, handle: u32, request_id: u32, state: *AudioServiceState, op: u16, payload: []const u8, request_start: u64) i32 {
+    defer recordRequestTicks(app, state, op, request_start);
+    if (payload.len != @sizeOf(r4os.abi.AudioServiceOutputRequest)) return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_invalid, "");
+    const request = std.mem.bytesToValue(r4os.abi.AudioServiceOutputRequest, payload);
+    const selection = op == r4os.abi.audio_service_op_select_output;
+    if (request.magic != r4os.abi.audio_output_control_magic or request.version != 1 or request.size != @sizeOf(r4os.abi.AudioServiceOutputRequest) or
+        request.reserved != 0 or request.index > output_policy.capacity or !output_policy.validId(&request.id) or
+        (selection and request.index != 0) or (!selection and request.id[0] != 0))
+        return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_invalid, "");
+    const refreshed = refreshOutputs(app, state, false);
+    if ((request.service_epoch != 0 and request.service_epoch != state.service_epoch) or
+        (request.revision != 0 and request.revision != state.outputs.revision))
+        return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_busy, "");
+    if (selection) {
+        if (!refreshed or state.outputs.reason == r4os.abi.audio_output_reason_api_unavailable or state.outputs.reason == r4os.abi.audio_output_reason_catalog_busy)
+            return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_busy, "");
+        const previous = state.outputs.desired;
+        const result = state.outputs.select(&app.audio, request.id);
+        if (result < 0) return app.sys.serviceEndpointReply(handle, request_id, result, "");
+        if (!std.mem.eql(u8, &previous, &state.outputs.desired)) scheduleMasterPersistence(app, state);
+        refreshBackendState(app, state);
+    }
+    const flags: u32 = (if (state.persist_pending) r4os.abi.audio_output_state_flag_persist_pending else @as(u32, 0)) |
+        (if (state.config_error) r4os.abi.audio_output_state_flag_config_error else @as(u32, 0));
+    return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, std.mem.asBytes(state.outputs.page(request.index, state.service_epoch, flags)));
 }
 
 fn handleSetMasterVolume(app: *const App, handle: u32, request_id: u32, state: *AudioServiceState, payload: []const u8, request_start: u64) i32 {
@@ -339,6 +383,7 @@ fn handleWriteStream(app: *const App, handle: u32, request_id: u32, client_id: u
         copyFixed(state.last_error[0..], "short-write");
         return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_write_stream, r4os.abi.service_api_result_invalid, request.stream_id, 0, request_start);
     }
+    _ = refreshOutputs(app, state, false);
     const data = payload[header_size .. header_size + @as(usize, @intCast(request.byte_count))];
     const session = sessionByStream(state, client_id, request.stream_id) orelse {
         copyFixed(state.last_error[0..], "bad-stream");
@@ -857,6 +902,7 @@ fn loadMasterConfiguration(app: *const App, state: *AudioServiceState) void {
         return;
     };
     master_control.restore(&state.master, persisted);
+    state.outputs.desired = persisted.desired_output;
     state.last_persisted = persisted;
     state.config_loaded = true;
     state.config_loads = 1;
@@ -864,16 +910,20 @@ fn loadMasterConfiguration(app: *const App, state: *AudioServiceState) void {
 }
 
 fn scheduleMasterPersistence(app: *const App, state: *AudioServiceState) void {
-    const snapshot = master_control.snapshot(state.master);
-    var generation = @atomicLoad(u64, &state.persistence.target_generation, .acquire) +% 1;
-    if (generation == 0) generation = 1;
+    const snapshot = configurationSnapshot(state);
+    var generation = @atomicLoad(u64, &state.persistence.target_generation, .seq_cst) +% 2;
+    if (generation == 0) generation = 2;
+    // Odd/even publication prevents a mixed gain/mute/output snapshot while
+    // the single persistence worker coalesces another user change.
+    @atomicStore(u64, &state.persistence.target_generation, generation - 1, .seq_cst);
     const delay = @max(app.sys.ticksFromMilliseconds(persist_debounce_ms), 1);
     const due_tick = app.sys.ticks() +| delay;
-    @atomicStore(u32, &state.persistence.target_selected_volume_fixed, snapshot.selected_volume_fixed, .monotonic);
-    @atomicStore(u32, &state.persistence.target_last_audible_volume_fixed, snapshot.last_audible_volume_fixed, .monotonic);
-    @atomicStore(u32, &state.persistence.target_muted, @intFromBool(snapshot.muted), .monotonic);
+    @atomicStore(u32, &state.persistence.target_selected_volume_fixed, snapshot.selected_volume_fixed, .seq_cst);
+    @atomicStore(u32, &state.persistence.target_last_audible_volume_fixed, snapshot.last_audible_volume_fixed, .seq_cst);
+    @atomicStore(u32, &state.persistence.target_muted, @intFromBool(snapshot.muted), .seq_cst);
     @atomicStore(u64, &state.persistence.target_due_tick, due_tick, .monotonic);
-    @atomicStore(u64, &state.persistence.target_generation, generation, .release);
+    for (0..8) |i| @atomicStore(u64, &state.persistence.target_output_words[i], std.mem.readInt(u64, snapshot.desired_output[i * 8 ..][0..8], .little), .seq_cst);
+    @atomicStore(u64, &state.persistence.target_generation, generation, .seq_cst);
     state.persist_pending = true;
     state.persist_due_tick = due_tick;
     // Start the single worker while the request that changed the setting is
@@ -893,7 +943,7 @@ fn serviceMasterPersistence(app: *const App, state: *AudioServiceState) void {
 
 fn startMasterPersistence(app: *const App, state: *AudioServiceState) void {
     if (!state.persist_pending or state.persistence.in_flight) return;
-    const snapshot = master_control.snapshot(state.master);
+    const snapshot = configurationSnapshot(state);
     if (persistedEqual(snapshot, state.last_persisted)) {
         state.persist_pending = false;
         copyFixed(state.last_error[0..], "config-save-coalesced");
@@ -932,7 +982,7 @@ fn joinMasterPersistence(app: *const App, state: *AudioServiceState, timeout_tic
     state.persist_writes +%= 1;
     state.config_error = false;
     state.last_persisted = saved_snapshot;
-    if (persistedEqual(master_control.snapshot(state.master), saved_snapshot)) state.persist_pending = false;
+    if (persistedEqual(configurationSnapshot(state), saved_snapshot)) state.persist_pending = false;
     copyFixed(state.last_error[0..], if (state.persist_pending) "config-save-coalesced" else "config-saved");
     return true;
 }
@@ -950,30 +1000,35 @@ fn persistenceWorkerMain(raw_job: u64) callconv(.c) i32 {
     const job: *PersistenceJob = @ptrFromInt(raw_job);
     const poll_ticks = @max(job.sys.ticksFromMilliseconds(persist_poll_ms), 1);
     while (true) {
-        const generation = @atomicLoad(u64, &job.target_generation, .acquire);
+        const generation = @atomicLoad(u64, &job.target_generation, .seq_cst);
         if (generation == 0) return 2;
+        if (generation & 1 != 0) {
+            job.sys.sleepTicks(1);
+            continue;
+        }
 
         while (true) {
-            if (@atomicLoad(u64, &job.target_generation, .acquire) != generation) break;
+            if (@atomicLoad(u64, &job.target_generation, .seq_cst) != generation) break;
             const due_tick = @atomicLoad(u64, &job.target_due_tick, .acquire);
             const now = job.sys.ticks();
             if (now >= due_tick) break;
             job.sys.sleepTicks(@min(poll_ticks, due_tick - now));
         }
-        if (@atomicLoad(u64, &job.target_generation, .acquire) != generation) continue;
+        if (@atomicLoad(u64, &job.target_generation, .seq_cst) != generation) continue;
 
-        const snapshot = master_control.Persisted{
-            .selected_volume_fixed = @atomicLoad(u32, &job.target_selected_volume_fixed, .acquire),
-            .last_audible_volume_fixed = @atomicLoad(u32, &job.target_last_audible_volume_fixed, .acquire),
-            .muted = @atomicLoad(u32, &job.target_muted, .acquire) != 0,
+        var snapshot = master_control.Persisted{
+            .selected_volume_fixed = @atomicLoad(u32, &job.target_selected_volume_fixed, .seq_cst),
+            .last_audible_volume_fixed = @atomicLoad(u32, &job.target_last_audible_volume_fixed, .seq_cst),
+            .muted = @atomicLoad(u32, &job.target_muted, .seq_cst) != 0,
         };
-        if (@atomicLoad(u64, &job.target_generation, .acquire) != generation) continue;
+        for (0..8) |i| std.mem.writeInt(u64, snapshot.desired_output[i * 8 ..][0..8], @atomicLoad(u64, &job.target_output_words[i], .seq_cst), .little);
+        if (@atomicLoad(u64, &job.target_generation, .seq_cst) != generation) continue;
 
         var bytes: [256]u8 = undefined;
         const encoded = master_control.encode(snapshot, bytes[0..]) orelse return 2;
         if (!saveMasterDocument(&job.sys, encoded)) return 1;
         job.completed_snapshot = snapshot;
-        if (@atomicLoad(u64, &job.target_generation, .acquire) == generation) return 0;
+        if (@atomicLoad(u64, &job.target_generation, .seq_cst) == generation) return 0;
     }
 }
 
@@ -1025,7 +1080,7 @@ fn masterDocumentMatches(ctx: *const r4os.r4sys.Context, path: [*:0]const u8, ex
 fn persistedEqual(a: master_control.Persisted, b: master_control.Persisted) bool {
     return a.selected_volume_fixed == b.selected_volume_fixed and
         a.last_audible_volume_fixed == b.last_audible_volume_fixed and
-        a.muted == b.muted;
+        a.muted == b.muted and std.mem.eql(u8, &a.desired_output, &b.desired_output);
 }
 
 fn recordPersistFailure(app: *const App, state: *AudioServiceState, message: []const u8) void {
@@ -1135,6 +1190,7 @@ fn sessionSlotByStream(state: *const AudioServiceState, client_id: u32, stream_i
 }
 
 fn refreshBackendState(app: *const App, state: *AudioServiceState) void {
+    _ = refreshOutputs(app, state, false);
     const performance = app.devices.performance();
     const summary = performance.summary() orelse {
         state.backend_present = false;
