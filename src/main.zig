@@ -327,9 +327,11 @@ fn handleOpenStream(app: *const App, handle: u32, request_id: u32, client_id: u3
         copyFixed(state.last_error[0..], "bad-open");
         return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_open_stream, r4os.abi.service_api_result_invalid, 0, 0, request_start);
     }
-    if (request.format != @intFromEnum(r4os.abi.AudioFormat.s16le)) {
+    if (request.rate == 0 or request.rate > 192_000 or request.channels == 0 or request.channels > 2 or
+        request.format != @intFromEnum(r4os.abi.AudioFormat.s16le))
+    {
         copyFixed(state.last_error[0..], "bad-format");
-        return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_open_stream, -1, 0, 0, request_start);
+        return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_open_stream, r4os.abi.service_api_result_invalid, 0, 0, request_start);
     }
     const slot = freeSession(state) orelse {
         copyFixed(state.last_error[0..], "full");
@@ -383,13 +385,19 @@ fn handleWriteStream(app: *const App, handle: u32, request_id: u32, client_id: u
         copyFixed(state.last_error[0..], "short-write");
         return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_write_stream, r4os.abi.service_api_result_invalid, request.stream_id, 0, request_start);
     }
-    _ = refreshOutputs(app, state, false);
     const data = payload[header_size .. header_size + @as(usize, @intCast(request.byte_count))];
     const session = sessionByStream(state, client_id, request.stream_id) orelse {
         copyFixed(state.last_error[0..], "bad-stream");
         return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_write_stream, -1, request.stream_id, 0, request_start);
     };
 
+    const frame_bytes = @as(usize, session.channels) * 2;
+    if (frame_bytes == 0 or data.len % frame_bytes != 0) {
+        copyFixed(state.last_error[0..], "partial-frame");
+        return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_write_stream, r4os.abi.service_api_result_invalid, request.stream_id, 0, request_start);
+    }
+
+    _ = refreshOutputs(app, state, false);
     if (session_ownership.isSilence(data)) {
         state.silence_write_count +%= 1;
         state.silence_bytes +%= @as(u64, @intCast(data.len));
@@ -443,13 +451,15 @@ fn handleWriteStream(app: *const App, handle: u32, request_id: u32, client_id: u
 fn handleCloseStream(app: *const App, handle: u32, request_id: u32, client_id: u32, state: *AudioServiceState, payload: []const u8, request_start: u64) i32 {
     var request: r4os.abi.AudioServiceStreamControlRequest = .{};
     state.stream_close_requests +%= 1;
-    if (!parseControlRequest(payload, &request)) {
+    if (!parseControlRequest(payload, &request) or client_id == 0 or request.stream_id == 0) {
         copyFixed(state.last_error[0..], "bad-close");
         return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_close_stream, r4os.abi.service_api_result_invalid, 0, 0, request_start);
     }
     const slot = sessionSlotByStream(state, client_id, request.stream_id) orelse {
-        copyFixed(state.last_error[0..], "bad-stream");
-        return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_close_stream, -1, request.stream_id, 0, request_start);
+        // Close states the desired absence of this client's stream. A lost
+        // reply may be retried after the first request already removed it.
+        copyFixed(state.last_error[0..], "stream-already-closed");
+        return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_close_stream, 0, request.stream_id, 0, request_start);
     };
 
     const backend_stream_id = state.sessions[slot].backend_stream_id;
