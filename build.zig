@@ -27,6 +27,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_master_tests = b.addRunArtifact(master_tests);
+    master_tests.root_module.addImport("r4os", sdk.createR4osModule(b.graph.host, .ReleaseSafe));
     const test_step = b.step("test", "Build AudioService and run session ownership tests");
     test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_ownership_tests.step);

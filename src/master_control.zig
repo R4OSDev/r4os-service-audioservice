@@ -181,6 +181,7 @@ test "legacy master volume never clears explicit mute" {
 }
 
 test "configuration round trips and rejects corrupt required fields" {
+    try @import("output_control_test.zig").check();
     var expected = Persisted{ .selected_volume_fixed = 32768, .last_audible_volume_fixed = 49152, .muted = true };
     @memcpy(expected.desired_output[0..11], "HDA-example");
     var bytes: [256]u8 = undefined;
