@@ -65,4 +65,12 @@ pub fn check() !void {
     try t.expectEqual(@as(i32, 0), state.select(&audio, Model.items[0].id));
     try t.expect(state.refresh(&audio, 2500, 500, false));
     try t.expectEqualDeep(Model.items[0].id, state.active);
+    // A DP endpoint follows the same priority and preference rules, but its
+    // published selection reason must identify the actual transport.
+    Model.items[1].kind = a.audio_output_kind_display_port;
+    try t.expect(state.refresh(&audio, 3000, 500, false));
+    try t.expectEqualDeep(Model.items[0].id, state.active);
+    try t.expectEqual(@as(i32, 0), state.select(&audio, @splat(0)));
+    try t.expectEqualDeep(Model.items[1].id, state.active);
+    try t.expectEqual(a.audio_output_reason_auto_display_port, state.reason);
 }

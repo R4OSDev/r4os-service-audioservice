@@ -85,7 +85,7 @@ pub const State = struct {
         for (self.catalog[0..self.count], 0..) |item, i| self.candidates[i] = .{
             .id = item.id,
             .available = item.availability == abi.audio_output_available,
-            .hdmi = item.kind == abi.audio_output_kind_hdmi,
+            .hdmi = item.kind == abi.audio_output_kind_hdmi or item.kind == abi.audio_output_kind_display_port,
             .active = item.flags & abi.audio_output_flag_active != 0,
         };
         var selector = Selector{ .owner = self, .audio = audio };
@@ -93,7 +93,8 @@ pub const State = struct {
         self.setActive(resolution.index);
         self.setReason(switch (resolution.reason) {
             .preferred => abi.audio_output_reason_preferred,
-            .auto_hdmi => abi.audio_output_reason_auto_hdmi,
+            .auto_hdmi => if (self.catalog[resolution.index.?].kind == abi.audio_output_kind_display_port)
+                abi.audio_output_reason_auto_display_port else abi.audio_output_reason_auto_hdmi,
             .auto_analog => abi.audio_output_reason_auto_analog,
             .preferred_unavailable => abi.audio_output_reason_preferred_unavailable,
             .none_available => abi.audio_output_reason_none_available,
