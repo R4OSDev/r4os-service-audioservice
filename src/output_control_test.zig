@@ -7,8 +7,13 @@ const Model = struct {
     var items: [2]a.AudioOutputInfo = undefined;
     var selections: usize = 0;
     var fail: bool = false;
+    var count: usize = 2;
+    var query_fail: bool = false;
+    var queries: usize = 0;
     fn info(index: u32, out: *a.AudioOutputInfo) callconv(.c) i32 {
-        if (index >= items.len) return 0;
+        queries += 1;
+        if (query_fail) return a.service_api_result_busy;
+        if (index >= count) return 0;
         out.* = items[index]; return 1;
     }
     fn select(id: *const [64]u8) callconv(.c) i32 {
@@ -28,6 +33,7 @@ pub fn check() !void {
     @memcpy(Model.items[1].id[0..4], "hdmi");
     @memcpy(Model.items[1].name[0..7], "Hisense"); // Model data, no physical receiver claim.
     Model.selections = 0; Model.fail = false;
+    Model.count = 2; Model.query_fail = false; Model.queries = 0;
     var table: a.R4XStartR4Audio = .{};
     table.audio_output_info = @intFromPtr(&Model.info);
     table.audio_select_output = @intFromPtr(&Model.select);
@@ -37,6 +43,13 @@ pub fn check() !void {
     var state: @import("output_control.zig").State = .{};
     try t.expect(state.refresh(&audio, 0, 500, true));
     try t.expectEqualDeep(Model.items[0].id, state.active);
+    try t.expect(state.backendPresent());
+    const queries = Model.queries;
+    for (1..500) |now| {
+        try t.expect(state.refresh(&audio, now, 500, false));
+        try t.expect(state.backendPresent());
+    }
+    try t.expectEqual(queries, Model.queries);
     Model.items[1].availability = a.audio_output_available;
     try t.expect(state.refresh(&audio, 500, 500, false));
     try t.expectEqualDeep(Model.items[1].id, state.active);
@@ -73,4 +86,40 @@ pub fn check() !void {
     try t.expectEqual(@as(i32, 0), state.select(&audio, @splat(0)));
     try t.expectEqualDeep(Model.items[1].id, state.active);
     try t.expectEqual(a.audio_output_reason_auto_display_port, state.reason);
+
+    // Failed enumeration must not turn the retained old active ID into a
+    // current backend receipt, including within the existing poll deadline.
+    const revision = state.revision;
+    Model.query_fail = true;
+    try t.expect(!state.refresh(&audio, 3500, 500, false));
+    try t.expect(!state.backendPresent());
+    try t.expect(state.revision > revision);
+    try t.expect(state.refresh(&audio, 3501, 500, false));
+    try t.expect(!state.backendPresent());
+    Model.query_fail = false;
+    try t.expect(state.refresh(&audio, 4000, 500, false));
+    try t.expect(state.backendPresent());
+
+    // A terminal backend withdrawal empties the authoritative catalog. A
+    // later provider with the same persistent IDs needs a new publication.
+    Model.count = 0;
+    try t.expect(state.refresh(&audio, 4500, 500, false));
+    try t.expect(!state.backendPresent());
+    try t.expectEqual(@as(usize, 0), state.count);
+    const empty_revision = state.revision;
+    Model.count = 2;
+    try t.expect(state.refresh(&audio, 5000, 500, false));
+    try t.expect(state.backendPresent());
+    try t.expect(state.revision > empty_revision);
+
+    // A stream's real NoEndpoint invalidates the cache before its deadline.
+    state.invalidate();
+    try t.expect(!state.backendPresent());
+    try t.expectEqual(@as(u8, 0), state.active[0]);
+    Model.query_fail = true;
+    try t.expect(!state.refresh(&audio, 5001, 500, false));
+    try t.expect(!state.backendPresent());
+    Model.query_fail = false;
+    try t.expect(state.refresh(&audio, 5501, 500, false));
+    try t.expect(state.backendPresent());
 }

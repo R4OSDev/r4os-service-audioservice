@@ -31,14 +31,12 @@ var service_outputs: output_control.State = .{};
 const App = struct {
     sys: r4os.r4sys.Context,
     audio: r4os.r4audio.Context,
-    devices: r4os.Devices,
     instance_id: u64,
 
     fn init(r4_app: *r4os.App) ?App {
         return .{
             .sys = r4_app.system(),
             .audio = r4_app.audioLowLevel() orelse return null,
-            .devices = r4_app.devices() orelse return null,
             .instance_id = r4_app.raw.instance_id,
         };
     }
@@ -112,7 +110,6 @@ const AudioServiceState = struct {
     silence_bytes: u64 = 0,
     idle_close_count: u64 = 0,
     peak_sessions: u32 = 0,
-    backend_present: bool = false,
     last_error: [r4os.abi.audio_service_error_bytes]u8 = .{0} ** r4os.abi.audio_service_error_bytes,
 };
 
@@ -236,7 +233,10 @@ fn configurationSnapshot(state: *const AudioServiceState) master_control.Persist
 }
 
 fn refreshOutputs(app: *const App, state: *AudioServiceState, force: bool) bool {
-    return state.outputs.refresh(&app.audio, app.sys.ticks(), @max(app.sys.ticksFromMilliseconds(500), 1), force);
+    const revision = state.outputs.revision;
+    const refreshed = state.outputs.refresh(&app.audio, app.sys.ticks(), @max(app.sys.ticksFromMilliseconds(500), 1), force);
+    if (state.outputs.revision != revision) bumpRevision(state);
+    return refreshed;
 }
 
 fn handleOutputs(app: *const App, handle: u32, request_id: u32, state: *AudioServiceState, op: u16, payload: []const u8, request_start: u64) i32 {
@@ -256,7 +256,9 @@ fn handleOutputs(app: *const App, handle: u32, request_id: u32, state: *AudioSer
         if (!refreshed or state.outputs.reason == r4os.abi.audio_output_reason_api_unavailable or state.outputs.reason == r4os.abi.audio_output_reason_catalog_busy)
             return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_busy, "");
         const previous = state.outputs.desired;
+        const revision = state.outputs.revision;
         const result = state.outputs.select(&app.audio, request.id);
+        if (state.outputs.revision != revision) bumpRevision(state);
         if (result < 0) return app.sys.serviceEndpointReply(handle, request_id, result, "");
         if (!std.mem.eql(u8, &previous, &state.outputs.desired)) scheduleMasterPersistence(app, state);
         refreshBackendState(app, state);
@@ -434,7 +436,11 @@ fn handleWriteStream(app: *const App, handle: u32, request_id: u32, client_id: u
             state.backend_fail +%= 1;
             copyFixed(state.last_error[0..], "write-failed");
         }
-        if (written == r4os.abi.service_api_result_no_endpoint) state.backend_present = false;
+        if (written == r4os.abi.service_api_result_no_endpoint) {
+            const revision = state.outputs.revision;
+            state.outputs.invalidate();
+            if (state.outputs.revision != revision) bumpRevision(state);
+        }
         return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_write_stream, written, request.stream_id, 0, request_start);
     }
 
@@ -569,7 +575,7 @@ fn makeStatus(state: *const AudioServiceState) r4os.abi.AudioServiceStatus {
         .silence_bytes = state.silence_bytes,
         .idle_close_count = state.idle_close_count,
     };
-    copyFixed(out.backend_name[0..], if (state.backend_present) "kernel-audio" else "none");
+    copyFixed(out.backend_name[0..], if (state.outputs.backendPresent()) "kernel-audio" else "none");
     copyFixed(out.mixer_name[0..], "SimpleKernelMixer");
     copyFixed(out.last_error[0..], spanZ(state.last_error[0..]));
     return out;
@@ -1157,7 +1163,7 @@ fn sessionSlotById(state: *const AudioServiceState, stream_id: u32) ?usize {
 fn materializeSession(app: *const App, state: *AudioServiceState, session: *Session) i32 {
     if (session.backend_stream_id != 0) return 0;
     refreshBackendState(app, state);
-    if (!state.backend_present) {
+    if (!state.outputs.backendPresent()) {
         copyFixed(state.last_error[0..], "no-backend");
         return r4os.abi.service_api_result_no_endpoint;
     }
@@ -1201,12 +1207,6 @@ fn sessionSlotByStream(state: *const AudioServiceState, client_id: u32, stream_i
 
 fn refreshBackendState(app: *const App, state: *AudioServiceState) void {
     _ = refreshOutputs(app, state, false);
-    const performance = app.devices.performance();
-    const summary = performance.summary() orelse {
-        state.backend_present = false;
-        return;
-    };
-    state.backend_present = summary.audio_active_backends > 0;
 }
 
 fn reapDisconnectedSessions(app: *const App, state: *AudioServiceState) void {
@@ -1294,7 +1294,7 @@ fn updatePeak(state: *AudioServiceState) void {
 fn statusFlags(state: *const AudioServiceState) u32 {
     var flags = r4os.abi.audio_service_flag_service_ready |
         r4os.abi.audio_service_flag_mixer_present;
-    if (state.backend_present) flags |= r4os.abi.audio_service_flag_backend_present;
+    if (state.outputs.backendPresent()) flags |= r4os.abi.audio_service_flag_backend_present;
     if (openSessionCount(state) > 0) flags |= r4os.abi.audio_service_flag_sessions_open;
     return flags;
 }

@@ -1,4 +1,4 @@
-﻿AUDSVC.R4X 0.1.8
+﻿AUDSVC.R4X 0.1.14
 =================
 
 AUDSVC ist der clientgebundene Audio- und Mixer-Service zwischen der
@@ -43,6 +43,21 @@ nutzt dessen reservierten Anhang fuer `materialized_sessions`,
 Write-/Bytezaehler, Latenzen und Fehler bleiben getrennt. Nur produktiv an das
 Backend uebergebene Bytes erhoehen `bytes_written`; unterdrueckte Stille besitzt
 eigene Zaehler.
+
+Ab0.87.16 stammt Backendpraesenz ausschliesslich aus dem vorhandenen
+Audioausgangskatalog: ausgewaehlter verfuegbarer Ausgang, gueltiger letzter
+Katalogabruf. Normale Master-/Statusabfragen, Streammaterialisierung und
+Session-Reaping rufen keinen systemweiten R4DEV-Performance-Snapshot auf;
+Devices-Kontext und R4DEV-Modulimport entfallen. Explizite Spectra-Diagnosen
+bleiben unveraendert verfuegbar. Der vorhandene500ms-Poll bleibt begrenzt.
+
+Katalogfehler bestaetigen keinen alten aktiven Status. Ein echter NoEndpoint
+beim Schreiben invalidiert den aktiven Cache und erzwingt vor erneuter
+Zulassung einen frischen Katalog. Gewuenschter Ausgang, genaue Stream- und
+Treiberbesitzpruefungen sowie echte Closequittungen bleiben erhalten.
+Katalogaenderungen erhoehen auch die Dienststatusrevision; Masterrevision
+bleibt fuer Gain/Mute zustaendig. Status ist keine Ressourcenleihe.
+Fachbelege und Grenzen: Docs/Audio/README.txt, Abschnitt0.87.16.
 
 Masterlautstaerke, Mute und Persistenz
 --------------------------------------

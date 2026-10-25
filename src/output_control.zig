@@ -16,6 +16,23 @@ pub const State = struct {
     candidates: [policy.capacity]policy.Candidate = undefined,
     reply: abi.AudioServiceOutputState = .{},
 
+    /// Only the selected, available route from a completed catalog is a
+    /// usable backend. A failed refresh retains old catalog data for display,
+    /// but cannot confirm its availability. This is not a stream/driver lease.
+    pub fn backendPresent(self: *const State) bool {
+        return self.active[0] != 0 and
+            self.reason != abi.audio_output_reason_api_unavailable and
+            self.reason != abi.audio_output_reason_catalog_busy;
+    }
+
+    /// A real stream write lost its endpoint. Do not resurrect the previous
+    /// positive status from the polling cache; obtain a fresh catalog first.
+    pub fn invalidate(self: *State) void {
+        self.setActive(null);
+        self.setReason(abi.audio_output_reason_catalog_busy);
+        self.next_poll = 0;
+    }
+
     pub fn refresh(self: *State, audio: *const r4os.r4audio.Context, now: u64, interval: u64, force: bool) bool {
         if (!force and now < self.next_poll) return true;
         self.next_poll = now +| interval;
