@@ -417,25 +417,15 @@ fn handleWriteStream(app: *const App, handle: u32, request_id: u32, client_id: u
 
 fn writeSessionData(app: *const App, state: *AudioServiceState, session: *Session, data: []const u8) i32 {
     _ = refreshOutputs(app, state, false);
-    if ((session.expectation.flags & r4os.abi.audio_flow_continuous) == 0 and session_ownership.isSilence(data)) {
+    const silent = session_ownership.isSilence(data);
+    // An active producer's zero PCM retains its duration and backend identity.
+    // Only initial discrete silence is lazy; explicit Close/disconnect owns
+    // the final hardware drain. No sample value is a producer-idle receipt.
+    if ((session.expectation.flags & r4os.abi.audio_flow_continuous) == 0 and session.backend_stream_id == 0 and silent) {
         state.silence_write_count +%= 1;
         state.silence_bytes +%= @as(u64, @intCast(data.len));
         state.last_write_bytes = 0;
-        if (session.backend_stream_id != 0) {
-            const idle_close = closeKernelSession(app, session);
-            if (idle_close >= 0) {
-                session.backend_stream_id = 0;
-                state.idle_close_count +%= 1;
-                state.backend_ok +%= 1;
-                bumpRevision(state);
-                copyFixed(state.last_error[0..], "stream-idle");
-            } else {
-                state.backend_fail +%= 1;
-                copyFixed(state.last_error[0..], "idle-close-failed");
-            }
-        } else {
-            copyFixed(state.last_error[0..], "silence-suppressed");
-        }
+        copyFixed(state.last_error[0..], "silence-suppressed");
         session.writes +%= 1;
         session.suppressed_bytes +%= data.len;
         return @intCast(data.len);
@@ -463,6 +453,10 @@ fn writeSessionData(app: *const App, state: *AudioServiceState, session: *Sessio
     }
 
     const bytes: u32 = @intCast(written);
+    if (silent and bytes != 0) {
+        state.silence_write_count +%= 1;
+        state.silence_bytes +%= bytes;
+    }
     session.writes +%= 1;
     session.bytes_written +%= @as(u64, bytes);
     state.bytes_written +%= @as(u64, bytes);
@@ -834,9 +828,10 @@ fn runSelfTest(app: *const App) i32 {
     const idle_written = app.sys.audioServiceWrite(stream_id, silence[0..]);
     if (idle_written != @as(i32, @intCast(silence.len))) return fail(&app.sys, "idle-write");
     if (app.sys.audioServiceStatus(&status) != r4os.abi.service_api_result_ok) return fail(&app.sys, "idle-status");
-    if (status.materialized_sessions != baseline_materialized or status.idle_close_count <= baseline_idle_closes) return fail(&app.sys, "idle-close");
+    if (status.materialized_sessions != baseline_materialized + 1 or status.idle_close_count != baseline_idle_closes) return fail(&app.sys, "active-silence-keeps-stream");
     const closed = app.sys.audioServiceClose(stream_id);
     if (closed != 0) return fail(&app.sys, "stream-close");
+    if (app.sys.audioServiceStatus(&status) != r4os.abi.service_api_result_ok or status.materialized_sessions != baseline_materialized) return fail(&app.sys, "explicit-idle-drained");
 
     const common_a = app.sys.audioServiceOpenStream(48_000, 2, .s16le);
     const common_b = app.sys.audioServiceOpenStream(48_000, 2, .s16le);

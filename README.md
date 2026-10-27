@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.15`
+- Version: `0.1.16`
 - Image target: `/R4OS/SERVICES/AUDSVC.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -12,7 +12,15 @@
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
 
-Version0.1.15 adds generation-bound stream progress, continuous source flow,
+Version0.1.16 forwards an active stream's zero PCM through its existing
+backend, preserving frame duration and identity. Initial unmaterialized
+discrete silence stays lazy. Explicit Close/producer stop/disconnect owns
+the real generation-bound terminal drain; zero sample values do not trigger
+Close or a new prefill. No background idle timer, kernel/HDA/ABI change or
+early drain acknowledgement. Silence-byte counters include actual accepted
+zero prefixes; only truly omitted initial frames are suppressed.
+
+Version0.1.15 added generation-bound stream progress, continuous source flow,
 tracked writes and close-with-progress (RPC11..14). Only initial read-only
 discovery accepts zero service/logical keys; mutations require both exact
 identities. The service binds the kernel generation before materializing flow.
