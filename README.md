@@ -4,13 +4,23 @@
 
 ## Package
 
-- Version: `0.1.7`
+- Version: `0.1.15`
 - Image target: `/R4OS/SERVICES/AUDSVC.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
 
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
+
+Version0.1.15 adds generation-bound stream progress, continuous source flow,
+tracked writes and close-with-progress (RPC11..14). Only initial read-only
+discovery accepts zero service/logical keys; mutations require both exact
+identities. The service binds the kernel generation before materializing flow.
+Progress separates source acceptance, backend/DMA/consumed and unconfirmed
+canonical frames. Continuous zero PCM is clocked; ordinary discrete silence
+suppression remains separate. A busy optional progress query never changes a
+successful write into a retry. The source clock deadline is absolute, including
+partial/BUSY retries. Final progress is captured before kernel stream release.
 
 ## Build
 

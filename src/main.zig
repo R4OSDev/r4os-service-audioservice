@@ -24,6 +24,7 @@ const program_instance_state_running: u8 = 0;
 var service_payload_buffer: [r4os.abi.service_api_max_payload]u8 = .{0xA5} ** r4os.abi.service_api_max_payload;
 var service_status_reply: r4os.abi.AudioServiceStatus = .{};
 var service_result_reply: r4os.abi.AudioServiceStreamResult = .{};
+var service_progress_reply: r4os.abi.AudioServiceStreamProgressState = .{};
 var service_master_reply: r4os.abi.AudioServiceMasterState = .{};
 // The bounded catalog and scratch page belong to this service instance, not its stack.
 var service_outputs: output_control.State = .{};
@@ -48,6 +49,11 @@ const Session = struct {
     client_generation: u64 = 0,
     stream_id: u32 = 0,
     backend_stream_id: u32 = 0,
+    generation: u64 = 0,
+    kernel_generation: u64 = 0,
+    suppressed_bytes: u64 = 0,
+    expectation: r4os.abi.AudioStreamExpectation = .{},
+    progress: r4os.abi.AudioStreamProgress = .{},
     rate: u32 = 0,
     channels: u16 = 0,
     format: u16 = 0,
@@ -72,6 +78,7 @@ const PersistenceJob = struct {
 const AudioServiceState = struct {
     sessions: [max_sessions]Session = .{Session{}} ** max_sessions,
     next_stream_id: u32 = 1,
+    next_stream_generation: u64 = 1,
     revision: u32 = 1,
     master: master_control.State = .{},
     outputs: *output_control.State = &service_outputs,
@@ -216,6 +223,7 @@ fn handleRequest(app: *const App, handle: u32, state: *AudioServiceState) i32 {
         r4os.abi.audio_service_op_write_stream => handleWriteStream(app, handle, header.request_id, header.client_id, state, payload, request_start),
         r4os.abi.audio_service_op_close_stream => handleCloseStream(app, handle, header.request_id, header.client_id, state, payload, request_start),
         r4os.abi.audio_service_op_set_stream_volume => handleSetStreamVolume(app, handle, header.request_id, header.client_id, state, payload, request_start),
+        r4os.abi.audio_service_op_stream_progress, r4os.abi.audio_service_op_stream_expectation, r4os.abi.audio_service_op_write_stream_tracked, r4os.abi.audio_service_op_close_stream_progress => handleTrackedStream(app, handle, header.request_id, header.client_id, state, header.op, payload, request_start),
         else => {
             state.bad_ops +%= 1;
             copyFixed(state.last_error[0..], "bad-op");
@@ -351,11 +359,15 @@ fn handleOpenStream(app: *const App, handle: u32, request_id: u32, client_id: u3
         copyFixed(state.last_error[0..], "id-full");
         return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_open_stream, r4os.abi.service_api_result_full, 0, 0, request_start);
     };
+    const stream_generation = state.next_stream_generation;
+    if (stream_generation == std.math.maxInt(u64)) return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_open_stream, r4os.abi.service_api_result_full, 0, 0, request_start);
+    state.next_stream_generation += 1;
     state.sessions[slot] = .{
         .open = true,
         .client_id = client_id,
         .client_generation = generation[0],
         .stream_id = stream_id,
+        .generation = stream_generation,
         .rate = request.rate,
         .channels = request.channels,
         .format = request.format,
@@ -399,13 +411,18 @@ fn handleWriteStream(app: *const App, handle: u32, request_id: u32, client_id: u
         return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_write_stream, r4os.abi.service_api_result_invalid, request.stream_id, 0, request_start);
     }
 
+    const written = writeSessionData(app, state, session, data);
+    return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_write_stream, written, request.stream_id, if (written > 0) @intCast(written) else 0, request_start);
+}
+
+fn writeSessionData(app: *const App, state: *AudioServiceState, session: *Session, data: []const u8) i32 {
     _ = refreshOutputs(app, state, false);
-    if (session_ownership.isSilence(data)) {
+    if ((session.expectation.flags & r4os.abi.audio_flow_continuous) == 0 and session_ownership.isSilence(data)) {
         state.silence_write_count +%= 1;
         state.silence_bytes +%= @as(u64, @intCast(data.len));
         state.last_write_bytes = 0;
         if (session.backend_stream_id != 0) {
-            const idle_close = app.audio.audioClose(session.backend_stream_id);
+            const idle_close = closeKernelSession(app, session);
             if (idle_close >= 0) {
                 session.backend_stream_id = 0;
                 state.idle_close_count +%= 1;
@@ -420,12 +437,13 @@ fn handleWriteStream(app: *const App, handle: u32, request_id: u32, client_id: u
             copyFixed(state.last_error[0..], "silence-suppressed");
         }
         session.writes +%= 1;
-        return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_write_stream, @intCast(data.len), request.stream_id, @intCast(data.len), request_start);
+        session.suppressed_bytes +%= data.len;
+        return @intCast(data.len);
     }
 
     const materialize = materializeSession(app, state, session);
     if (materialize < 0) {
-        return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_write_stream, materialize, request.stream_id, 0, request_start);
+        return materialize;
     }
 
     const written = app.audio.audioWrite(session.backend_stream_id, data);
@@ -441,7 +459,7 @@ fn handleWriteStream(app: *const App, handle: u32, request_id: u32, client_id: u
             state.outputs.invalidate();
             if (state.outputs.revision != revision) bumpRevision(state);
         }
-        return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_write_stream, written, request.stream_id, 0, request_start);
+        return written;
     }
 
     const bytes: u32 = @intCast(written);
@@ -451,7 +469,7 @@ fn handleWriteStream(app: *const App, handle: u32, request_id: u32, client_id: u
     state.last_write_bytes = bytes;
     state.backend_ok +%= 1;
     copyFixed(state.last_error[0..], "stream-write");
-    return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_write_stream, written, request.stream_id, bytes, request_start);
+    return written;
 }
 
 fn handleCloseStream(app: *const App, handle: u32, request_id: u32, client_id: u32, state: *AudioServiceState, payload: []const u8, request_start: u64) i32 {
@@ -468,8 +486,7 @@ fn handleCloseStream(app: *const App, handle: u32, request_id: u32, client_id: u
         return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_close_stream, 0, request.stream_id, 0, request_start);
     };
 
-    const backend_stream_id = state.sessions[slot].backend_stream_id;
-    const rc = if (backend_stream_id == 0) 0 else app.audio.audioClose(backend_stream_id);
+    const rc = closeKernelSession(app, &state.sessions[slot]);
     if (rc >= 0) {
         state.sessions[slot] = .{};
         state.backend_ok +%= 1;
@@ -542,6 +559,115 @@ fn replyResult(app: *const App, handle: u32, request_id: u32, state: *AudioServi
     copyFixed(service_result_reply.last_error[0..], spanZ(state.last_error[0..]));
     const out_bytes: [*]const u8 = @ptrCast(&service_result_reply);
     return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, out_bytes[0..@sizeOf(r4os.abi.AudioServiceStreamResult)]);
+}
+
+fn readRecord(comptime T: type, bytes: []const u8) ?T {
+    if (bytes.len != @sizeOf(T)) return null;
+    var value: T = undefined;
+    @memcpy(std.mem.asBytes(&value), bytes);
+    return value;
+}
+
+fn validProgressKey(key: r4os.abi.AudioServiceStreamProgressRequest) bool {
+    const expected = r4os.abi.AudioServiceStreamProgressRequest{};
+    return key.magic == expected.magic and key.version == expected.version and key.size == @sizeOf(@TypeOf(key)) and
+        key.stream_id != 0 and key.flags == 0;
+}
+
+fn replyTrackedState(app: *const App, handle: u32, request_id: u32, state: *AudioServiceState, op: u16, requested_id: u32, session: ?*Session, result: i32, request_start: u64) i32 {
+    var rc = result;
+    if (session) |s| {
+        if (s.backend_stream_id != 0 or op != r4os.abi.audio_service_op_close_stream_progress) s.progress.flags &= ~r4os.abi.audio_progress_fresh;
+        if (s.backend_stream_id != 0 and s.kernel_generation != 0) {
+            var progress: r4os.abi.AudioStreamProgress = .{};
+            const query = app.audio.audioStreamProgress(s.backend_stream_id, s.kernel_generation, &progress);
+            if (query == 0) s.progress = progress else if (op == r4os.abi.audio_service_op_stream_progress and result == 0) {
+                rc = query;
+            }
+        }
+    }
+    recordRequestTicks(app, state, op, request_start);
+    service_progress_reply = .{ .result = rc, .stream_id = requested_id, .service_epoch = state.service_epoch };
+    if (session) |s| {
+        service_progress_reply.stream_generation = s.generation;
+        service_progress_reply.suppressed_bytes = s.suppressed_bytes;
+        service_progress_reply.accepted_source_bytes = s.bytes_written +% s.suppressed_bytes;
+        service_progress_reply.progress = s.progress;
+    }
+    return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, std.mem.asBytes(&service_progress_reply));
+}
+
+fn applySessionExpectation(app: *const App, session: *Session, desired: r4os.abi.AudioStreamExpectation) i32 {
+    if (session.backend_stream_id == 0) return if (desired.flags == 0) 0 else r4os.abi.service_api_result_no_endpoint;
+    const bind = bindKernelSession(app, session);
+    if (bind < 0) return bind;
+    var kernel = desired;
+    kernel.stream_generation = session.kernel_generation;
+    return app.audio.audioSetStreamExpectation(session.backend_stream_id, &kernel);
+}
+
+fn handleTrackedStream(app: *const App, handle: u32, request_id: u32, client_id: u32, state: *AudioServiceState, op: u16, payload: []const u8, request_start: u64) i32 {
+    const Key = r4os.abi.AudioServiceStreamProgressRequest;
+    const invalid = r4os.abi.service_api_result_invalid;
+    var key: Key = .{};
+    var desired: r4os.abi.AudioStreamExpectation = .{};
+    var data: []const u8 = "";
+    var write_due: u64 = 0;
+    if (op == r4os.abi.audio_service_op_stream_expectation) {
+        const request = readRecord(r4os.abi.AudioServiceStreamFlowRequest, payload) orelse return replyTrackedState(app, handle, request_id, state, op, 0, null, invalid, request_start);
+        key = request.stream;
+        desired = request.expectation;
+        if (desired.version != 1 or desired.size != @sizeOf(@TypeOf(desired)) or desired.reserved != 0 or desired.stream_generation != 0 or
+            (desired.flags & ~r4os.abi.audio_flow_continuous) != 0 or
+            (desired.flags != 0 and (desired.source_due_ns == 0 or desired.low_water_frames == 0 or desired.low_water_frames >= desired.high_water_frames)))
+            return replyTrackedState(app, handle, request_id, state, op, key.stream_id, null, invalid, request_start);
+    } else if (op == r4os.abi.audio_service_op_write_stream_tracked) {
+        const T = r4os.abi.AudioServiceStreamTrackedWriteRequest;
+        if (payload.len < @sizeOf(T)) return replyTrackedState(app, handle, request_id, state, op, 0, null, invalid, request_start);
+        const request = readRecord(T, payload[0..@sizeOf(T)]).?;
+        const expected = T{};
+        if (request.magic != expected.magic or request.version != expected.version or request.size != @sizeOf(T) or request.flags != 0 or request.reserved != 0 or
+            request.byte_count == 0 or request.byte_count != payload.len - @sizeOf(T)) return replyTrackedState(app, handle, request_id, state, op, 0, null, invalid, request_start);
+        key = .{ .stream_id = request.stream_id, .service_epoch = request.service_epoch, .stream_generation = request.stream_generation };
+        data = payload[@sizeOf(T)..];
+        write_due = request.source_due_ns;
+    } else {
+        key = readRecord(Key, payload) orelse return replyTrackedState(app, handle, request_id, state, op, 0, null, invalid, request_start);
+    }
+    if (!validProgressKey(key) or client_id == 0) return replyTrackedState(app, handle, request_id, state, op, key.stream_id, null, invalid, request_start);
+    const session = sessionByStream(state, client_id, key.stream_id) orelse return replyTrackedState(app, handle, request_id, state, op, key.stream_id, null, r4os.abi.service_api_result_not_found, request_start);
+    const discovery = op == r4os.abi.audio_service_op_stream_progress and key.service_epoch == 0 and key.stream_generation == 0;
+    if (!discovery and (key.service_epoch != state.service_epoch or key.stream_generation != session.generation))
+        return replyTrackedState(app, handle, request_id, state, op, key.stream_id, null, r4os.abi.service_api_result_not_found, request_start);
+    var rc: i32 = 0;
+    if (op == r4os.abi.audio_service_op_stream_expectation) {
+        if (desired.flags != 0) rc = materializeSession(app, state, session);
+        if (rc == 0) rc = applySessionExpectation(app, session, desired);
+        if (rc == 0) session.expectation = desired;
+    } else if (op == r4os.abi.audio_service_op_write_stream_tracked) {
+        const frame_bytes = @as(usize, session.channels) * 2;
+        if (frame_bytes == 0 or data.len % frame_bytes != 0 or ((session.expectation.flags != 0) != (write_due != 0)))
+            return replyTrackedState(app, handle, request_id, state, op, key.stream_id, session, invalid, request_start);
+        state.stream_write_requests +%= 1;
+        if (session.expectation.flags != 0) {
+            desired = session.expectation;
+            desired.source_due_ns = write_due;
+            rc = applySessionExpectation(app, session, desired);
+            if (rc == 0) session.expectation = desired;
+        }
+        if (rc == 0) rc = writeSessionData(app, state, session, data);
+    } else if (op == r4os.abi.audio_service_op_close_stream_progress) {
+        state.stream_close_requests +%= 1;
+        rc = closeKernelSession(app, session);
+        if (rc >= 0) {
+            const reply = replyTrackedState(app, handle, request_id, state, op, key.stream_id, session, rc, request_start);
+            session.* = .{};
+            state.backend_ok +%= 1;
+            bumpRevision(state);
+            return reply;
+        }
+    }
+    return replyTrackedState(app, handle, request_id, state, op, key.stream_id, session, rc, request_start);
 }
 
 fn makeStatus(state: *const AudioServiceState) r4os.abi.AudioServiceStatus {
@@ -1161,7 +1287,7 @@ fn sessionSlotById(state: *const AudioServiceState, stream_id: u32) ?usize {
 }
 
 fn materializeSession(app: *const App, state: *AudioServiceState, session: *Session) i32 {
-    if (session.backend_stream_id != 0) return 0;
+    if (session.backend_stream_id != 0) return bindKernelSession(app, session);
     refreshBackendState(app, state);
     if (!state.outputs.backendPresent()) {
         copyFixed(state.last_error[0..], "no-backend");
@@ -1186,7 +1312,33 @@ fn materializeSession(app: *const App, state: *AudioServiceState, session: *Sess
     state.backend_ok +%= 1;
     copyFixed(state.last_error[0..], "stream-materialized");
     bumpRevision(state);
+    return bindKernelSession(app, session);
+}
+
+fn bindKernelSession(app: *const App, session: *Session) i32 {
+    if (session.backend_stream_id == 0) return 0;
+    if (session.kernel_generation != 0) return 0;
+    var progress: r4os.abi.AudioStreamProgress = .{};
+    const rc = app.audio.audioStreamProgress(session.backend_stream_id, 0, &progress);
+    if (rc < 0) return rc;
+    if (progress.stream_generation == 0 or progress.stream_id != session.backend_stream_id) return r4os.abi.service_api_result_invalid;
+    session.kernel_generation = progress.stream_generation;
+    session.progress = progress;
     return 0;
+}
+
+fn closeKernelSession(app: *const App, session: *Session) i32 {
+    if (session.backend_stream_id == 0) return 0;
+    const bind = bindKernelSession(app, session);
+    if (bind < 0) return bind;
+    var progress: r4os.abi.AudioStreamProgress = .{};
+    const rc = app.audio.audioCloseStreamProgress(session.backend_stream_id, session.kernel_generation, &progress);
+    if (rc >= 0) {
+        session.progress = progress;
+        session.backend_stream_id = 0;
+        session.kernel_generation = 0;
+    }
+    return rc;
 }
 
 fn sessionByStream(state: *AudioServiceState, client_id: u32, stream_id: u32) ?*Session {
@@ -1319,7 +1471,7 @@ fn recordRequestTicks(app: *const App, state: *AudioServiceState, op: u16, start
     state.request_total_ticks +%= elapsed;
     state.request_last_ticks = elapsed;
     if (elapsed > state.request_max_ticks) state.request_max_ticks = elapsed;
-    if (op == r4os.abi.audio_service_op_write_stream) {
+    if (op == r4os.abi.audio_service_op_write_stream or op == r4os.abi.audio_service_op_write_stream_tracked) {
         state.write_request_total_ticks +%= elapsed;
         state.write_request_last_ticks = elapsed;
         if (elapsed > state.write_request_max_ticks) state.write_request_max_ticks = elapsed;
