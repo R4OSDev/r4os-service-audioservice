@@ -4,6 +4,7 @@ const master_control = @import("master_control.zig");
 const output_policy = @import("output_policy.zig");
 const output_control = @import("output_control.zig");
 const session_ownership = @import("session_ownership.zig");
+const pending_close = @import("pending_close.zig");
 
 const service_name = "AUDSVC";
 const selftest_arg = "/SELFTEST";
@@ -77,6 +78,7 @@ const PersistenceJob = struct {
 
 const AudioServiceState = struct {
     sessions: [max_sessions]Session = .{Session{}} ** max_sessions,
+    legacy_closes: [max_sessions]pending_close.Pending = .{pending_close.Pending{}} ** max_sessions,
     next_stream_id: u32 = 1,
     next_stream_generation: u64 = 1,
     revision: u32 = 1,
@@ -159,6 +161,7 @@ fn runService(app: *const App) i32 {
     var next_reap_tick = app.sys.ticks() +| reap_interval;
     while (true) {
         const now = app.sys.ticks();
+        serviceLegacyCloses(app, handle, &state);
         serviceMasterPersistence(app, &state);
         if (openSessionCount(&state) > 0 and now >= next_reap_tick) {
             reapDisconnectedSessions(app, &state);
@@ -174,6 +177,13 @@ fn runService(app: *const App) i32 {
         if (state.persistence.in_flight) {
             const poll_tick = app.sys.ticks() +| @max(app.sys.ticksFromMilliseconds(persist_poll_ms), 1);
             if (deadline == null or poll_tick < deadline.?) deadline = poll_tick;
+        }
+        for (&state.legacy_closes) |*pending| {
+            if (pending.request != null) {
+                const next = app.sys.ticks() +| 1;
+                if (deadline == null or next < deadline.?) deadline = next;
+                break;
+            }
         }
         switch (service_loop.wait(deadline)) {
             .requests => |pending| {
@@ -480,7 +490,18 @@ fn handleCloseStream(app: *const App, handle: u32, request_id: u32, client_id: u
         return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_close_stream, 0, request.stream_id, 0, request_start);
     };
 
+    if (state.legacy_closes[slot].request != null)
+        return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_close_stream, r4os.abi.service_api_result_busy, request.stream_id, 0, request_start);
     const rc = closeKernelSession(app, &state.sessions[slot]);
+    if (rc == r4os.abi.service_api_result_busy) {
+        // Legacy callers await one terminal response. Keep only copied keys;
+        // finite tracked Close keeps its existing immediate Busy response.
+        // 500 ms covers the original 400 ms DMA drain + 100 ms Work retirement
+        // and is below the unchanged 1000 ms legacy caller timeout.
+        _ = state.legacy_closes[slot].begin(closeIdentity(&state.sessions[slot]), request_id, request_start, @max(app.sys.ticksFromMilliseconds(500), 1));
+        copyFixed(state.last_error[0..], "stream-close-pending");
+        return 0;
+    }
     if (rc >= 0) {
         state.sessions[slot] = .{};
         state.backend_ok +%= 1;
@@ -491,6 +512,38 @@ fn handleCloseStream(app: *const App, handle: u32, request_id: u32, client_id: u
         copyFixed(state.last_error[0..], "close-failed");
     }
     return replyResult(app, handle, request_id, state, r4os.abi.audio_service_op_close_stream, rc, request.stream_id, 0, request_start);
+}
+
+fn closeIdentity(session: *const Session) pending_close.Identity {
+    return .{ .client = session.client_id, .client_generation = session.client_generation, .stream = session.stream_id, .generation = session.generation };
+}
+
+const LegacyCloseBackend = struct {
+    app: *const App,
+    session: *Session,
+    pub fn matches(self: *@This(), owner: pending_close.Identity) bool {
+        return self.session.open and std.meta.eql(closeIdentity(self.session), owner);
+    }
+    pub fn closeOnce(self: *@This()) i32 { return closeKernelSession(self.app, self.session); }
+};
+
+fn serviceLegacyCloses(app: *const App, handle: u32, state: *AudioServiceState) void {
+    for (&state.legacy_closes, 0..) |*pending, slot| {
+        var backend = LegacyCloseBackend{ .app = app, .session = &state.sessions[slot] };
+        const reply = pending.poll(&backend, app.sys.ticks(), r4os.abi.service_api_result_busy, r4os.abi.service_api_result_not_found) orelse continue;
+        if (reply.result >= 0) {
+            state.sessions[slot] = .{};
+            state.backend_ok +%= 1;
+            copyFixed(state.last_error[0..], "stream-close");
+            bumpRevision(state);
+        } else if (reply.result != r4os.abi.service_api_result_busy and reply.result != r4os.abi.service_api_result_not_found) {
+            state.backend_fail +%= 1;
+            copyFixed(state.last_error[0..], "close-failed");
+        }
+        // Publication may lose a race with the caller's own finite deadline.
+        // A late reply never claims delivery and never closes another stream.
+        _ = replyResult(app, handle, reply.request.request_id, state, r4os.abi.audio_service_op_close_stream, reply.result, reply.request.owner.stream, 0, reply.request.started);
+    }
 }
 
 fn handleSetStreamVolume(app: *const App, handle: u32, request_id: u32, client_id: u32, state: *AudioServiceState, payload: []const u8, request_start: u64) i32 {
@@ -1377,6 +1430,7 @@ fn reapDisconnectedSessions(app: *const App, state: *AudioServiceState) void {
         owner_index += 1;
         if (running_generation != 0) continue;
         const rc = if (session.backend_stream_id == 0) 0 else app.audio.audioClose(session.backend_stream_id);
+        if (rc == r4os.abi.service_api_result_busy) continue;
         if (rc < 0) {
             state.backend_fail +%= 1;
             copyFixed(state.last_error[0..], "reap-failed");

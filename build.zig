@@ -29,6 +29,12 @@ pub fn build(b: *std.Build) void {
     const run_master_tests = b.addRunArtifact(master_tests);
     master_tests.root_module.addImport("r4os", sdk.createR4osModule(b.graph.host, .ReleaseSafe));
     const test_step = b.step("test", "Build AudioService and run session ownership tests");
+    const close_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/pending_close.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(close_tests).step);
     test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_ownership_tests.step);
     test_step.dependOn(&run_master_tests.step);
