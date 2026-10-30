@@ -1,4 +1,4 @@
-﻿AUDSVC.R4X 0.1.14
+﻿AUDSVC.R4X 0.1.21
 =================
 
 AUDSVC ist der clientgebundene Audio- und Mixer-Service zwischen der
@@ -10,18 +10,20 @@ Streambesitz und Lazy-Lebenszyklus
 ----------------------------------
 
 Open reserviert einen logischen Stream in der festen 16-Slot-Servicetabelle,
-bindet ihn an ID und Generation der aufrufenden Programminstanz und vergibt eine eigene
-generationsfreie, nicht mit Kernelhandles vermischte ID. Es oeffnet noch
+bindet ihn an ID und Generation der aufrufenden Programminstanz und vergibt
+eine eigene logische ID und Generation, getrennt von Kernelhandle und
+Kernelgeneration. Es oeffnet noch
 keinen Kernel-/Treiberstream. Erst der erste PCM-Block mit mindestens einem
-von null verschiedenen Byte materialisiert das Backend und wendet die
+von null verschiedenen Byte oder ein expliziter kontinuierlicher Flow
+materialisiert das Backend und wendet die
 effektive Stream-/Masterlautstaerke an.
 
-Ein vollstaendig stiller Block wird dem Client mit seiner ganzen Laenge als
-konsumiert bestaetigt, aber nicht an das Backend geschrieben. Ist der
-Backendstream aktiv, wird er genau einmal geschlossen; weitere Stille bleibt
-rein logisch. Ein spaeteres Signal materialisiert denselben logischen Stream
-erneut. SetVolume aktualisiert einen noch nicht materialisierten Stream ohne
-Backendaufruf. Close, Client-Reap, Dienstneustart und Shutdown schliessen nur
+Nur anfaengliche, nicht materialisierte diskrete Stille wird ohne Backend
+als akzeptiert gezaehlt. Seit0.1.16 behalten Nullframes eines aktiven Streams
+ihre Dauer und Backendidentitaet; sie loesen weder Close noch neues Prefill
+aus. SetVolume aktualisiert einen noch nicht materialisierten Stream ohne
+Backendaufruf. Close, Producer-Stop, Client-Reap, Dienstneustart und Shutdown
+besitzen den echten terminalen Drain und schliessen nur
 tatsaechlich vorhandene Backendhandles und leeren den logischen Slot
 idempotent.
 
@@ -57,7 +59,36 @@ Zulassung einen frischen Katalog. Gewuenschter Ausgang, genaue Stream- und
 Treiberbesitzpruefungen sowie echte Closequittungen bleiben erhalten.
 Katalogaenderungen erhoehen auch die Dienststatusrevision; Masterrevision
 bleibt fuer Gain/Mute zustaendig. Status ist keine Ressourcenleihe.
-Fachbelege und Grenzen: Docs/Audio/README.txt, Abschnitt0.87.16.
+Fachbelege und Grenzen: Docs/Audio/README.txt und Audio/PlaybackProgress.txt.
+
+Ausgangskatalog und Auswahl
+--------------------------
+
+Seit0.1.20 liest der vorhandene500ms-Cache einen vollstaendigen kopierten
+Katalog mit echten Registry-/Provideridentitaeten. Unvollstaendige oder
+ungueltige Erfassung bestaetigt keine Verfuegbarkeit aus der letzten Anzeige.
+Seit0.1.21 erstellt der Dispatcher nur einen begrenzten Auswahlplan. Ein
+einziger dienstgebundener Worker ruft die bestehenden Kernel-/Treiberowner
+auf, auch fuer automatische Auswahl und Fallback. Ziel und Request samt
+Clientgeneration und Dienstepoch werden kopiert; der Worker leiht keine
+Dispatcherpuffer oder Katalogreferenzen.
+
+Waehrenddessen bleiben Status, Master und zulaessige bestehende Streamarbeit
+erreichbar. Katalogseiten behalten die letzte Anzeige mit catalog-busy und
+ohne Backendbestaetigung. Neue Materialisierung und ein weiterer Auswahlwunsch
+erhalten Busy. Es gibt waehrenddessen keinen indirekten Refresh/Fallback im
+Dispatcher. Nur ein laufender Auftrag benoetigt den10ms-Joinpoll; alle
+Transportbudgets bleiben unveraendert.
+
+Erst die echte Joinquittung erlaubt die Ergebnispublikation. Ein Provider-ACK
+kann den gewuenschten Ausgang einmal bestaetigen; der anschliessend frisch
+erfasste Katalog entscheidet unabhaengig ueber die aktuelle Anzeige. Ein leer
+gewordener Katalog meldet keinen bevorzugten aktiven Ausgang. Ein beliebiger
+Joinfehler gibt Workerargumente und Handle nicht frei. Timeout, verschwundene
+Antwort oder Clientende bewirken keinen automatischen Replay. Nach unklarem
+Ergebnis liest der Client den aktuellen Zustand und die Dienstepoch erneut.
+Beim Dienstende wird zuerst die Auswahl gejoint, dann die bestaetigte
+Praeferenz gespeichert und erst danach werden Streams geschlossen.
 
 Masterlautstaerke, Mute und Persistenz
 --------------------------------------
@@ -96,7 +127,8 @@ Unter Linux:
 
 Der Host-Testschritt baut und inspiziert AUDSVC.R4X und prueft Client-/Streambesitz,
 Stilleerkennung, gebuendelte Inventarabfragen und generationsgebundenen Reap.
-Lazy-Silence, Signal und Idle-Close werden im gezielten Gast-Selbsttest geprueft.
+Lazy-Silence, Signal und echter terminaler Close werden im Gast geprueft;
+aktive Null-PCM behaelt ihre Dauer und Backendidentitaet.
 Der integrierte Gast-Selbsttest belegt ausserdem Mute-Kompatibilitaet,
 gemeinsame Masterauffaecherung auf zwei Streams und Persistenz ueber einen
 Dienstneustart; danach stellt er den urspruenglichen Masterzustand wieder her.

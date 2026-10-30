@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.20`
+- Version: `0.1.21`
 - Image target: `/R4OS/SERVICES/AUDSVC.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -47,10 +47,11 @@ mapped local checkouts.
 
 ## Documentation
 
-Open creates a client-bound logical stream. The backend stream is materialized
-only by the first non-silent PCM block. Complete zero blocks are acknowledged
-without a backend payload and close an active backend once; later signal may
-materialize it again. Status version 2 exposes logical/materialized sessions,
+Open creates a client-bound logical stream. Non-silent PCM or an explicit
+continuous flow materializes its backend. Only initial, unmaterialized
+discrete silence is suppressed; an active stream's zero frames retain their
+duration and backend identity. Explicit Close, producer stop or disconnect
+owns the terminal drain. Status version 2 exposes logical/materialized sessions,
 lazy opens, suppressed silence and idle closes in the existing fixed record.
 
 Append-only master-state operations expose the selected and effective 16.16
@@ -58,6 +59,26 @@ gain, explicit mute, the last audible value, revision, service epoch and
 persistence diagnostics. AUDSVC owns this global state and safely persists it
 to `C:\R4OS\CONFIG\AUDIO.R4S`; clients do not maintain a second mixer state.
 The legacy set-volume operation remains compatible and never changes mute.
+
+Version0.1.21 separates output policy planning from driver selection. One
+service-owned worker holds a copied operation of at most four existing policy
+candidates. Explicit, automatic and fallback selections use the same path;
+the dispatcher publishes a result only after the exact-generation Join.
+While selection is pending, pages retain the last display with catalog-busy
+reason and no backend-present confirmation. Status, master and permissible
+existing-stream operations remain reachable; new backend materialization and
+another selection return Busy. No output refresh or hidden fallback waits in
+the dispatcher during that operation. With no provider call needed, automatic
+policy can settle immediately without claiming new hardware availability.
+
+A successful provider ACK commits the original preference once, including if
+its caller already timed out or exited. A fresh catalog independently states
+current availability; withdrawal/reordering cannot retain an obsolete selected
+reason. Missing replies are benign and never replay the mutation. Callers
+resolve ambiguous timeout/Busy results through fresh reads and service epochs.
+Shutdown joins selection before flushing its preference and closing streams.
+Only an actual Join retires the copied worker data; an arbitrary Join error
+keeps that data and handle. The existing RPC/transport budgets are unchanged.
 
 Detailed German technical notes are in `DOCUMENTATION.de.txt`.
 Source-transfer provenance is recorded in `PROVENANCE.txt`.

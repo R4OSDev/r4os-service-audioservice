@@ -3,6 +3,7 @@ const r4os = @import("r4os");
 const master_control = @import("master_control.zig");
 const output_policy = @import("output_policy.zig");
 const output_control = @import("output_control.zig");
+const output_selection = @import("output_selection.zig");
 const session_ownership = @import("session_ownership.zig");
 const ClientInventory = session_ownership.ClientInventory;
 const pending_close = @import("pending_close.zig");
@@ -17,6 +18,7 @@ const persist_debounce_ms: u64 = 500;
 const persist_poll_ms: u64 = 100;
 const persist_retry_ms: u64 = 2000;
 const persist_selftest_wait_ms: u64 = 15_000;
+const output_poll_ms: u64 = 10;
 const master_config_path: [*:0]const u8 = "C:\\R4OS\\CONFIG\\AUDIO.R4S";
 const master_config_stage_path: [*:0]const u8 = "C:\\R4OS\\CONFIG\\AUDIO.TMP";
 const master_config_backup_path: [*:0]const u8 = "C:\\R4OS\\CONFIG\\AUDIO.BAK";
@@ -29,6 +31,7 @@ var service_progress_reply: r4os.abi.AudioServiceStreamProgressState = .{};
 var service_master_reply: r4os.abi.AudioServiceMasterState = .{};
 // The bounded catalog and scratch page belong to this service instance, not its stack.
 var service_outputs: output_control.State = .{};
+var service_output_selection: output_selection.Job = .{};
 
 const App = struct {
     sys: r4os.r4sys.Context,
@@ -160,6 +163,7 @@ fn runService(app: *const App) i32 {
     var next_reap_tick = app.sys.ticks() +| reap_interval;
     while (true) {
         const now = app.sys.ticks();
+        serviceOutputSelection(app, handle, &state, 0);
         serviceLegacyCloses(app, handle, &state);
         serviceMasterPersistence(app, &state);
         if (openSessionCount(&state) > 0 and now >= next_reap_tick) {
@@ -177,6 +181,10 @@ fn runService(app: *const App) i32 {
             const poll_tick = app.sys.ticks() +| @max(app.sys.ticksFromMilliseconds(persist_poll_ms), 1);
             if (deadline == null or poll_tick < deadline.?) deadline = poll_tick;
         }
+        if (service_output_selection.in_flight) {
+            const poll_tick = app.sys.ticks() +| @max(app.sys.ticksFromMilliseconds(output_poll_ms), 1);
+            if (deadline == null or poll_tick < deadline.?) deadline = poll_tick;
+        }
         for (&state.legacy_closes) |*pending| {
             if (pending.request != null) {
                 const next = app.sys.ticks() +| 1;
@@ -188,26 +196,20 @@ fn runService(app: *const App) i32 {
             .requests => |pending| {
                 const rc = service_loop.drain(pending, handleRequest, .{ app, handle, &state });
                 if (rc >= 0 or rc == r4os.abi.service_api_result_not_found) continue;
-                flushMasterPersistence(app, &state);
-                closeOpenSessions(app, &state);
-                _ = app.sys.serviceEndpointUnregister(handle);
+                cleanupService(app, handle, &state);
                 return rc;
             },
             .idle, .deadline => {},
             .stop => break,
             .failure => |raw| {
-                flushMasterPersistence(app, &state);
-                closeOpenSessions(app, &state);
-                _ = app.sys.serviceEndpointUnregister(handle);
+                cleanupService(app, handle, &state);
                 return raw;
             },
         }
     }
 
     service_loop.report(service_name);
-    flushMasterPersistence(app, &state);
-    closeOpenSessions(app, &state);
-    _ = app.sys.serviceEndpointUnregister(handle);
+    cleanupService(app, handle, &state);
     app.sys.println("AUDSVC stopped cleanly");
     return 0;
 }
@@ -225,7 +227,7 @@ fn handleRequest(app: *const App, handle: u32, state: *AudioServiceState) i32 {
     const rc = switch (header.op) {
         r4os.abi.audio_service_op_status => replyStatus(app, handle, header.request_id, state, request_start),
         r4os.abi.audio_service_op_set_master_volume => handleSetMasterVolume(app, handle, header.request_id, state, payload, request_start),
-        r4os.abi.audio_service_op_outputs, r4os.abi.audio_service_op_select_output => handleOutputs(app, handle, header.request_id, state, header.op, payload, request_start),
+        r4os.abi.audio_service_op_outputs, r4os.abi.audio_service_op_select_output => handleOutputs(app, handle, header.request_id, header.client_id, state, header.op, payload, request_start),
         r4os.abi.audio_service_op_master_status => replyMasterState(app, handle, header.request_id, state, request_start),
         r4os.abi.audio_service_op_set_master_state => handleSetMasterState(app, handle, header.request_id, state, payload, request_start),
         r4os.abi.audio_service_op_open_stream => handleOpenStream(app, handle, header.request_id, header.client_id, state, payload, request_start),
@@ -250,14 +252,99 @@ fn configurationSnapshot(state: *const AudioServiceState) master_control.Persist
 }
 
 fn refreshOutputs(app: *const App, state: *AudioServiceState, force: bool) bool {
-    const revision = state.outputs.revision;
-    const refreshed = state.outputs.refresh(&app.audio, app.sys.ticks(), @max(app.sys.ticksFromMilliseconds(500), 1), force);
-    if (state.outputs.revision != revision) bumpRevision(state);
-    return refreshed;
+    return refreshOutputsWithResolve(app, state, force, true);
 }
 
-fn handleOutputs(app: *const App, handle: u32, request_id: u32, state: *AudioServiceState, op: u16, payload: []const u8, request_start: u64) i32 {
-    defer recordRequestTicks(app, state, op, request_start);
+fn refreshOutputsWithResolve(app: *const App, state: *AudioServiceState, force: bool, resolve: bool) bool {
+    // Even a seemingly harmless refresh may plan a fallback. Keep the last
+    // display while a worker owns selection, with no new availability claim.
+    if (service_output_selection.in_flight) return false;
+    const revision = state.outputs.revision;
+    const now = app.sys.ticks();
+    const due = force or now >= state.outputs.next_poll;
+    const refreshed = state.outputs.refresh(&app.audio, now, @max(app.sys.ticksFromMilliseconds(500), 1), force);
+    if (state.outputs.revision != revision) bumpRevision(state);
+    if (refreshed and due and resolve) {
+        const operation = state.outputs.prepare(state.outputs.desired, false) catch return false;
+        _ = startOutputSelection(app, state, operation, null);
+    }
+    return refreshed and !service_output_selection.in_flight;
+}
+
+fn outputPageFlags(state: *const AudioServiceState) u32 {
+    return (if (state.persist_pending) r4os.abi.audio_output_state_flag_persist_pending else @as(u32, 0)) |
+        (if (state.config_error) r4os.abi.audio_output_state_flag_config_error else @as(u32, 0));
+}
+
+fn applyOutputOutcome(app: *const App, state: *AudioServiceState, operation: *const output_control.Operation, outcome: output_control.Outcome) void {
+    const previous = state.outputs.desired;
+    const revision = state.outputs.revision;
+    state.outputs.complete(operation, outcome);
+    if (state.outputs.revision != revision) bumpRevision(state);
+    if (!std.mem.eql(u8, &previous, &state.outputs.desired)) scheduleMasterPersistence(app, state);
+}
+
+fn startOutputSelection(app: *const App, state: *AudioServiceState, operation: output_control.Operation, request: ?output_selection.Request) i32 {
+    if (service_output_selection.in_flight) return r4os.abi.service_api_result_busy;
+    if (operation.count == 0) {
+        applyOutputOutcome(app, state, &operation, operation.execute(&app.audio));
+        return 0;
+    }
+    const result = service_output_selection.start(&app.sys, app.audio, state.service_epoch, operation, request);
+    if (result != 0) {
+        applyOutputOutcome(app, state, &operation, .{ .result = result, .resolution = operation.fallback });
+        return result;
+    }
+    const revision = state.outputs.revision;
+    state.outputs.transition();
+    if (state.outputs.revision != revision) bumpRevision(state);
+    return 0;
+}
+
+fn serviceOutputSelection(app: *const App, handle: u32, state: *AudioServiceState, timeout_ticks: u64) void {
+    switch (service_output_selection.poll(&app.sys, timeout_ticks)) {
+        .idle, .pending => {},
+        .fault => copyFixed(state.last_error[0..], "output-join-unconfirmed"),
+        .completed => |completed| {
+            if (completed.service_epoch != state.service_epoch) {
+                state.outputs.invalidate();
+                return;
+            }
+            applyOutputOutcome(app, state, &completed.operation, completed.outcome);
+            // Observe actual post-ACK provider state, without automatically
+            // replaying a failed/ambiguous intent from the completed request.
+            const observed = refreshOutputsWithResolve(app, state, true, false);
+            if (observed and completed.outcome.result == 0) {
+                const revision = state.outputs.revision;
+                state.outputs.reconcile();
+                if (state.outputs.revision != revision) bumpRevision(state);
+            }
+            if (completed.request) |request| {
+                recordRequestTicks(app, state, r4os.abi.audio_service_op_select_output, request.started);
+                var reader = ClientInventory{ .ctx = &app.sys };
+                var generation: [1]u64 = undefined;
+                if (!session_ownership.collectRunning(&.{.{ .id = request.client_id, .generation = request.client_generation }}, &generation, &reader) or generation[0] == 0) return;
+                // Caller timeout/close does not prove worker retirement and
+                // never causes another selection. Missing replies are benign.
+                _ = r4os.app_services.replyIfPending(app.sys, handle, request.request_id, completed.outcome.result, if (completed.outcome.result == 0) std.mem.asBytes(state.outputs.page(0, state.service_epoch, outputPageFlags(state))) else "");
+            }
+        },
+    }
+}
+
+fn cleanupService(app: *const App, handle: u32, state: *AudioServiceState) void {
+    while (service_output_selection.in_flight) {
+        serviceOutputSelection(app, handle, state, r4os.abi.io_wait_forever);
+        if (service_output_selection.in_flight) app.sys.sleepTicks(1);
+    }
+    flushMasterPersistence(app, state);
+    closeOpenSessions(app, state);
+    _ = app.sys.serviceEndpointUnregister(handle);
+}
+
+fn handleOutputs(app: *const App, handle: u32, request_id: u32, client_id: u32, state: *AudioServiceState, op: u16, payload: []const u8, request_start: u64) i32 {
+    var deferred = false;
+    defer if (!deferred) recordRequestTicks(app, state, op, request_start);
     if (payload.len != @sizeOf(r4os.abi.AudioServiceOutputRequest)) return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_invalid, "");
     const request = std.mem.bytesToValue(r4os.abi.AudioServiceOutputRequest, payload);
     const selection = op == r4os.abi.audio_service_op_select_output;
@@ -270,19 +357,22 @@ fn handleOutputs(app: *const App, handle: u32, request_id: u32, state: *AudioSer
         (request.revision != 0 and request.revision != state.outputs.revision))
         return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_busy, "");
     if (selection) {
-        if (!refreshed or state.outputs.reason == r4os.abi.audio_output_reason_api_unavailable or state.outputs.reason == r4os.abi.audio_output_reason_catalog_busy)
+        if (!refreshed or service_output_selection.in_flight or state.outputs.reason == r4os.abi.audio_output_reason_api_unavailable or state.outputs.reason == r4os.abi.audio_output_reason_catalog_busy)
             return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_busy, "");
-        const previous = state.outputs.desired;
-        const revision = state.outputs.revision;
-        const result = state.outputs.select(&app.audio, request.id);
-        if (state.outputs.revision != revision) bumpRevision(state);
+        if (client_id == 0) return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_invalid, "");
+        var reader = ClientInventory{ .ctx = &app.sys };
+        var generation: [1]u64 = undefined;
+        if (!session_ownership.collectRunning(&.{.{ .id = client_id, .generation = 0 }}, &generation, &reader) or generation[0] == 0)
+            return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_busy, "");
+        const operation = state.outputs.prepare(request.id, true) catch |err| return app.sys.serviceEndpointReply(handle, request_id, if (err == error.NoEndpoint) r4os.abi.service_api_result_no_endpoint else r4os.abi.service_api_result_invalid, "");
+        const result = startOutputSelection(app, state, operation, .{ .client_id = client_id, .client_generation = generation[0], .request_id = request_id, .started = request_start });
         if (result < 0) return app.sys.serviceEndpointReply(handle, request_id, result, "");
-        if (!std.mem.eql(u8, &previous, &state.outputs.desired)) scheduleMasterPersistence(app, state);
-        refreshBackendState(app, state);
+        if (service_output_selection.in_flight) {
+            deferred = true;
+            return r4os.abi.service_api_result_ok;
+        }
     }
-    const flags: u32 = (if (state.persist_pending) r4os.abi.audio_output_state_flag_persist_pending else @as(u32, 0)) |
-        (if (state.config_error) r4os.abi.audio_output_state_flag_config_error else @as(u32, 0));
-    return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, std.mem.asBytes(state.outputs.page(request.index, state.service_epoch, flags)));
+    return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, std.mem.asBytes(state.outputs.page(request.index, state.service_epoch, outputPageFlags(state))));
 }
 
 fn handleSetMasterVolume(app: *const App, handle: u32, request_id: u32, state: *AudioServiceState, payload: []const u8, request_start: u64) i32 {
@@ -521,7 +611,9 @@ const LegacyCloseBackend = struct {
     pub fn matches(self: *@This(), owner: pending_close.Identity) bool {
         return self.session.open and std.meta.eql(closeIdentity(self.session), owner);
     }
-    pub fn closeOnce(self: *@This()) i32 { return closeKernelSession(self.app, self.session); }
+    pub fn closeOnce(self: *@This()) i32 {
+        return closeKernelSession(self.app, self.session);
+    }
 };
 
 fn serviceLegacyCloses(app: *const App, handle: u32, state: *AudioServiceState) void {
@@ -1333,7 +1425,12 @@ fn sessionSlotById(state: *const AudioServiceState, stream_id: u32) ?usize {
 
 fn materializeSession(app: *const App, state: *AudioServiceState, session: *Session) i32 {
     if (session.backend_stream_id != 0) return bindKernelSession(app, session);
+    if (service_output_selection.in_flight) {
+        copyFixed(state.last_error[0..], "output-transition-busy");
+        return r4os.abi.service_api_result_busy;
+    }
     refreshBackendState(app, state);
+    if (service_output_selection.in_flight) return r4os.abi.service_api_result_busy;
     if (!state.outputs.backendPresent()) {
         copyFixed(state.last_error[0..], "no-backend");
         return r4os.abi.service_api_result_no_endpoint;

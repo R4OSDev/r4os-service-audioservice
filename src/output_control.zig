@@ -3,6 +3,39 @@ const r4os = @import("r4os");
 const abi = r4os.abi;
 const policy = @import("output_policy.zig");
 
+pub const Target = struct {
+    id: policy.Id = policy.automatic,
+    index: usize = 0,
+    reason: policy.Reason = .none_available,
+};
+pub const Outcome = struct {
+    result: i32 = abi.service_api_result_invalid,
+    resolution: policy.Resolution = .{},
+};
+/// A bounded copy of the existing policy's candidates. No catalog, service
+/// state, reply or caller storage is borrowed by the selection worker.
+pub const Operation = struct {
+    targets: [4]Target = .{Target{}} ** 4,
+    count: usize = 0,
+    desired: policy.Id = policy.automatic,
+    change_desired: bool = false,
+    fallback: policy.Resolution = .{},
+
+    pub fn execute(self: *const Operation, audio: *const r4os.r4audio.Context) Outcome {
+        if (self.count == 0) return .{ .result = 0, .resolution = self.fallback };
+        var last: i32 = abi.service_api_result_invalid;
+        for (self.targets[0..self.count]) |target| {
+            const result = audio.audioSelectOutput(&target.id);
+            if (result == 0) return .{ .result = 0, .resolution = .{ .index = target.index, .reason = target.reason } };
+            last = if (result < 0) result else abi.service_api_result_invalid;
+            // Busy is not a failed/finished route. Do not turn an ambiguous
+            // attempt into another mutation; preserve an available old route.
+            if (last == abi.service_api_result_busy or self.fallback.index != null) break;
+        }
+        return .{ .result = last, .resolution = self.fallback };
+    }
+};
+
 pub const State = struct {
     desired: policy.Id = policy.automatic,
     active: policy.Id = policy.automatic,
@@ -45,11 +78,14 @@ pub const State = struct {
         const result = audio.audioOutputCatalog(&self.scratch, &epoch);
         if (result != 1) {
             self.setReason(if (result == abi.err_no_fn or result == abi.err_no_group)
-                abi.audio_output_reason_api_unavailable else abi.audio_output_reason_catalog_busy);
+                abi.audio_output_reason_api_unavailable
+            else
+                abi.audio_output_reason_catalog_busy);
             return false;
         }
         if (epoch.version != 1 or epoch.size != @sizeOf(abi.AudioOutputCatalog) or epoch.registry_generation == 0 or
-            epoch.count > self.scratch.len or epoch.provider_count > epoch.providers.len) {
+            epoch.count > self.scratch.len or epoch.provider_count > epoch.providers.len)
+        {
             self.setReason(abi.audio_output_reason_catalog_busy);
             return false;
         }
@@ -57,7 +93,8 @@ pub const State = struct {
         var provider_total: usize = 0;
         for (epoch.providers[0..epoch.provider_count], 0..) |provider, i| {
             if (provider.registration == 0 or provider.generation == 0 or provider.count > 32 or
-                provider.active_index < -1 or (provider.active_index >= 0 and @as(u32, @intCast(provider.active_index)) >= provider.count)) {
+                provider.active_index < -1 or (provider.active_index >= 0 and @as(u32, @intCast(provider.active_index)) >= provider.count))
+            {
                 self.setReason(abi.audio_output_reason_catalog_busy);
                 return false;
             }
@@ -88,34 +125,74 @@ pub const State = struct {
         @memcpy(self.catalog[0..count], self.scratch[0..count]);
         self.count = count;
         self.catalog_epoch = epoch;
-        self.resolve(audio);
+        // Observe actual provider flags only. Preparing policy or selecting a
+        // replacement is a separate dispatcher/worker operation.
+        self.setActive(self.activeIndex());
         return true;
     }
 
-    pub fn select(self: *State, audio: *const r4os.r4audio.Context, id: policy.Id) i32 {
-        if (!policy.validId(&id)) return abi.service_api_result_invalid;
-        if (id[0] != 0) {
-            var found: ?usize = null;
+    pub fn prepare(self: *State, desired: policy.Id, change_desired: bool) error{ Invalid, NoEndpoint }!Operation {
+        if (!policy.validId(&desired)) return error.Invalid;
+        var operation: Operation = .{ .desired = desired, .change_desired = change_desired };
+        if (change_desired and desired[0] != 0) {
             for (self.catalog[0..self.count], 0..) |item, i| {
-                if (std.mem.eql(u8, &id, &item.id) and item.availability == abi.audio_output_available) {
-                    found = i;
-                    break;
+                if (std.mem.eql(u8, &desired, &item.id) and item.availability == abi.audio_output_available) {
+                    operation.targets[0] = .{ .id = desired, .index = i, .reason = .preferred };
+                    operation.count = 1;
+                    operation.fallback = .{ .index = self.activeIndex(), .reason = .activation_failed };
+                    return operation;
                 }
             }
-            const index = found orelse return abi.service_api_result_no_endpoint;
-            const result = audio.audioSelectOutput(&id);
-            if (result < 0) {
-                self.setReason(abi.audio_output_reason_activation_failed);
-                return result;
-            }
-            self.setActive(index);
+            return error.NoEndpoint;
         }
-        if (!std.mem.eql(u8, &self.desired, &id)) {
-            self.desired = id;
+        for (self.catalog[0..self.count], 0..) |item, i| self.candidates[i] = .{
+            .id = item.id,
+            .available = item.availability == abi.audio_output_available,
+            .hdmi = item.kind == abi.audio_output_kind_hdmi or item.kind == abi.audio_output_kind_display_port,
+            .active = item.flags & abi.audio_output_flag_active != 0,
+        };
+        var recorder = Recorder{ .operation = &operation, .catalog = self.catalog[0..self.count] };
+        operation.fallback = policy.resolve(self.candidates[0..self.count], desired, &recorder);
+        return operation;
+    }
+
+    pub fn transition(self: *State) void {
+        self.setReason(abi.audio_output_reason_catalog_busy);
+    }
+
+    /// Reconcile a successful route ACK with the subsequently captured actual
+    /// catalog. A withdrawn/reordered route must not keep an obsolete reason.
+    /// Planning can mark a transition, but never replays a provider mutation.
+    pub fn reconcile(self: *State) void {
+        const operation = self.prepare(self.desired, false) catch {
+            self.transition();
+            return;
+        };
+        if (operation.count == 0) {
+            self.complete(&operation, .{ .result = 0, .resolution = operation.fallback });
+        } else self.transition();
+    }
+
+    /// Called after the real Join receipt, or for a policy that requires no
+    /// provider call. A failed operation never commits a new preference.
+    pub fn complete(self: *State, operation: *const Operation, outcome: Outcome) void {
+        if (outcome.result == 0 and operation.change_desired and !std.mem.eql(u8, &self.desired, &operation.desired)) {
+            self.desired = operation.desired;
             self.bump();
         }
-        self.resolve(audio);
-        return 0;
+        const resolution = outcome.resolution;
+        self.setActive(resolution.index);
+        self.setReason(switch (resolution.reason) {
+            .preferred => abi.audio_output_reason_preferred,
+            .auto_hdmi => if (self.catalog[resolution.index.?].kind == abi.audio_output_kind_display_port)
+                abi.audio_output_reason_auto_display_port
+            else
+                abi.audio_output_reason_auto_hdmi,
+            .auto_analog => abi.audio_output_reason_auto_analog,
+            .preferred_unavailable => abi.audio_output_reason_preferred_unavailable,
+            .none_available => abi.audio_output_reason_none_available,
+            .activation_failed => abi.audio_output_reason_activation_failed,
+        });
     }
 
     pub fn page(self: *State, index: u32, epoch: u64, flags: u32) *const abi.AudioServiceOutputState {
@@ -128,25 +205,12 @@ pub const State = struct {
         return &self.reply;
     }
 
-    fn resolve(self: *State, audio: *const r4os.r4audio.Context) void {
-        for (self.catalog[0..self.count], 0..) |item, i| self.candidates[i] = .{
-            .id = item.id,
-            .available = item.availability == abi.audio_output_available,
-            .hdmi = item.kind == abi.audio_output_kind_hdmi or item.kind == abi.audio_output_kind_display_port,
-            .active = item.flags & abi.audio_output_flag_active != 0,
-        };
-        var selector = Selector{ .owner = self, .audio = audio };
-        const resolution = policy.resolve(self.candidates[0..self.count], self.desired, &selector);
-        self.setActive(resolution.index);
-        self.setReason(switch (resolution.reason) {
-            .preferred => abi.audio_output_reason_preferred,
-            .auto_hdmi => if (self.catalog[resolution.index.?].kind == abi.audio_output_kind_display_port)
-                abi.audio_output_reason_auto_display_port else abi.audio_output_reason_auto_hdmi,
-            .auto_analog => abi.audio_output_reason_auto_analog,
-            .preferred_unavailable => abi.audio_output_reason_preferred_unavailable,
-            .none_available => abi.audio_output_reason_none_available,
-            .activation_failed => abi.audio_output_reason_activation_failed,
-        });
+    fn activeIndex(self: *const State) ?usize {
+        var active: ?usize = null;
+        for (self.catalog[0..self.count], 0..) |item, i| {
+            if (item.availability == abi.audio_output_available and item.flags & abi.audio_output_flag_active != 0) active = i;
+        }
+        return active;
     }
 
     fn setActive(self: *State, index: ?usize) void {
@@ -172,11 +236,17 @@ pub const State = struct {
         if (self.revision == 0) self.revision = 1;
     }
 
-    const Selector = struct {
-        owner: *State,
-        audio: *const r4os.r4audio.Context,
-        pub fn activate(self: *Selector, index: usize) bool {
-            return self.audio.audioSelectOutput(&self.owner.catalog[index].id) == 0;
+    const Recorder = struct {
+        operation: *Operation,
+        catalog: []const abi.AudioOutputInfo,
+        pub fn activate(self: *Recorder, index: usize) bool {
+            const item = self.catalog[index];
+            std.debug.assert(self.operation.count < self.operation.targets.len);
+            self.operation.targets[self.operation.count] = .{ .id = item.id, .index = index, .reason = if (self.operation.desired[0] != 0)
+                (if (std.mem.eql(u8, &self.operation.desired, &item.id)) .preferred else .preferred_unavailable)
+            else if (item.kind == abi.audio_output_kind_hdmi or item.kind == abi.audio_output_kind_display_port) .auto_hdmi else .auto_analog };
+            self.operation.count += 1;
+            return false; // Planning does not invoke the provider.
         }
     };
 };
