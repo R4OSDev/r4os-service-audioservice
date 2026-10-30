@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
         }),
     });
+    ownership_tests.root_module.addImport("r4os", sdk.createR4osModule(b.graph.host, .ReleaseSafe));
     const run_ownership_tests = b.addRunArtifact(ownership_tests);
     const master_tests = b.addTest(.{
         .root_module = b.createModule(.{

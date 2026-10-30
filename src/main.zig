@@ -4,6 +4,7 @@ const master_control = @import("master_control.zig");
 const output_policy = @import("output_policy.zig");
 const output_control = @import("output_control.zig");
 const session_ownership = @import("session_ownership.zig");
+const ClientInventory = session_ownership.ClientInventory;
 const pending_close = @import("pending_close.zig");
 
 const service_name = "AUDSVC";
@@ -19,7 +20,6 @@ const persist_selftest_wait_ms: u64 = 15_000;
 const master_config_path: [*:0]const u8 = "C:\\R4OS\\CONFIG\\AUDIO.R4S";
 const master_config_stage_path: [*:0]const u8 = "C:\\R4OS\\CONFIG\\AUDIO.TMP";
 const master_config_backup_path: [*:0]const u8 = "C:\\R4OS\\CONFIG\\AUDIO.BAK";
-const program_instance_state_running: u8 = 0;
 
 // Non-zero initializer keeps the R4X scratch buffer file-backed instead of BSS-only.
 var service_payload_buffer: [r4os.abi.service_api_max_payload]u8 = .{0xA5} ** r4os.abi.service_api_max_payload;
@@ -1441,31 +1441,6 @@ fn reapDisconnectedSessions(app: *const App, state: *AudioServiceState) void {
         bumpRevision(state);
     }
 }
-
-const ClientInventory = struct {
-    ctx: *const r4os.r4sys.Context,
-    cursor: r4os.abi.ProgramInventoryCursor = .{},
-    items: [16]r4os.abi.ProgramInstanceSnapshot = undefined,
-    records: [16]session_ownership.Record = undefined,
-
-    pub fn begin(self: *ClientInventory) bool {
-        var summary: r4os.abi.ProgramInventorySummary = .{};
-        return self.ctx.programInventoryBegin(&self.cursor, &summary) == r4os.abi.program_handle_ok;
-    }
-    pub fn next(self: *ClientInventory) ?session_ownership.Page {
-        var page: r4os.abi.ProgramInventoryPageInfo = .{};
-        if (self.ctx.programInventoryPrograms(&self.cursor, &self.items, &page) != r4os.abi.program_handle_ok or
-            page.snapshot_generation != self.cursor.snapshot_generation or page.returned > self.items.len or
-            (page.status != r4os.abi.program_inventory_status_complete and page.status != r4os.abi.program_inventory_status_more)) return null;
-        for (self.items[0..page.returned], 0..) |item, i| {
-            self.records[i] = .{
-                .owner = .{ .id = item.handle.instance_id, .generation = item.handle.generation },
-                .running = item.info.state == program_instance_state_running,
-            };
-        }
-        return .{ .records = self.records[0..page.returned], .complete = page.status == r4os.abi.program_inventory_status_complete };
-    }
-};
 
 fn openSessionCount(state: *const AudioServiceState) u32 {
     var count: u32 = 0;
