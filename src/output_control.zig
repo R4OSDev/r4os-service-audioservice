@@ -14,6 +14,7 @@ pub const State = struct {
     catalog: [policy.capacity]abi.AudioOutputInfo = .{abi.AudioOutputInfo{}} ** policy.capacity,
     scratch: [policy.capacity]abi.AudioOutputInfo = .{abi.AudioOutputInfo{}} ** policy.capacity,
     candidates: [policy.capacity]policy.Candidate = undefined,
+    catalog_epoch: abi.AudioOutputCatalog = .{},
     reply: abi.AudioServiceOutputState = .{},
 
     /// Only the selected, available route from a completed catalog is a
@@ -36,28 +37,57 @@ pub const State = struct {
     pub fn refresh(self: *State, audio: *const r4os.r4audio.Context, now: u64, interval: u64, force: bool) bool {
         if (!force and now < self.next_poll) return true;
         self.next_poll = now +| interval;
-        if (!audio.hasFn("audio_output_info") or !audio.hasFn("audio_select_output")) {
+        if (!audio.hasFn("audio_output_catalog") or !audio.hasFn("audio_select_output")) {
             self.setReason(abi.audio_output_reason_api_unavailable);
             return false;
         }
-        var count: usize = 0;
-        while (count < self.scratch.len) : (count += 1) {
-            const result = audio.audioOutputInfo(@intCast(count), &self.scratch[count]);
-            if (result == 0) break;
-            if (result != 1 or !policy.validId(&self.scratch[count].id) or self.scratch[count].id[0] == 0) {
+        var epoch: abi.AudioOutputCatalog = .{};
+        const result = audio.audioOutputCatalog(&self.scratch, &epoch);
+        if (result != 1) {
+            self.setReason(if (result == abi.err_no_fn or result == abi.err_no_group)
+                abi.audio_output_reason_api_unavailable else abi.audio_output_reason_catalog_busy);
+            return false;
+        }
+        if (epoch.version != 1 or epoch.size != @sizeOf(abi.AudioOutputCatalog) or epoch.registry_generation == 0 or
+            epoch.count > self.scratch.len or epoch.provider_count > epoch.providers.len) {
+            self.setReason(abi.audio_output_reason_catalog_busy);
+            return false;
+        }
+        const count: usize = epoch.count;
+        var provider_total: usize = 0;
+        for (epoch.providers[0..epoch.provider_count], 0..) |provider, i| {
+            if (provider.registration == 0 or provider.generation == 0 or provider.count > 32 or
+                provider.active_index < -1 or (provider.active_index >= 0 and @as(u32, @intCast(provider.active_index)) >= provider.count)) {
+                self.setReason(abi.audio_output_reason_catalog_busy);
+                return false;
+            }
+            for (epoch.providers[0..i]) |previous| if (previous.registration == provider.registration) {
+                self.setReason(abi.audio_output_reason_catalog_busy);
+                return false;
+            };
+            provider_total += provider.count;
+        }
+        if (provider_total != count) {
+            self.setReason(abi.audio_output_reason_catalog_busy);
+            return false;
+        }
+        for (self.scratch[0..count], 0..) |item, index| {
+            if (!policy.validId(&item.id) or item.id[0] == 0) {
                 self.setReason(abi.audio_output_reason_catalog_busy);
                 return false; // Do not publish a partial enumeration.
             }
-            for (self.scratch[0..count]) |previous| {
-                if (std.mem.eql(u8, &previous.id, &self.scratch[count].id)) {
+            for (self.scratch[0..index]) |previous| {
+                if (std.mem.eql(u8, &previous.id, &item.id)) {
                     self.setReason(abi.audio_output_reason_catalog_busy);
                     return false;
                 }
             }
         }
-        if (count != self.count or !std.mem.eql(u8, std.mem.sliceAsBytes(self.catalog[0..count]), std.mem.sliceAsBytes(self.scratch[0..count]))) self.bump();
+        if (count != self.count or !std.mem.eql(u8, std.mem.asBytes(&self.catalog_epoch), std.mem.asBytes(&epoch)) or
+            !std.mem.eql(u8, std.mem.sliceAsBytes(self.catalog[0..count]), std.mem.sliceAsBytes(self.scratch[0..count]))) self.bump();
         @memcpy(self.catalog[0..count], self.scratch[0..count]);
         self.count = count;
+        self.catalog_epoch = epoch;
         self.resolve(audio);
         return true;
     }

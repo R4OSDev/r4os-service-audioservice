@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.16`
+- Version: `0.1.20`
 - Image target: `/R4OS/SERVICES/AUDSVC.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -12,7 +12,7 @@
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
 
-Version0.1.16 forwards an active stream's zero PCM through its existing
+Since version0.1.16 an active stream's zero PCM goes through its existing
 backend, preserving frame duration and identity. Initial unmaterialized
 discrete silence stays lazy. Explicit Close/producer stop/disconnect owns
 the real generation-bound terminal drain; zero sample values do not trigger
@@ -67,3 +67,13 @@ Source-transfer provenance is recorded in `PROVENANCE.txt`.
 Original R4OS material is licensed under Apache License 2.0. See `LICENSE`
 and `NOTICE`. Any repository-specific external material is documented in
 `THIRD_PARTY_NOTICES.md`.
+# Complete output capture (0.88.55, AUDSVC0.1.20)
+
+The existing500ms poll uses the complete R4AUDIO catalog capture. A single
+registry permit and revalidated provider epochs replace repeated per-index
+prefix scans. The service publishes only a complete count/unique-ID catalog,
+including new identities when row bytes stay identical. Busy, invalid or
+unsupported capture retains the last display while clearing its availability
+confirmation. Desired selection, fallback, NoEndpoint invalidation and the
+existing service epoch/revision page protocol remain in force. Physical route,
+ELD, Stop and DMA acknowledgements are separate observations.

@@ -10,11 +10,28 @@ const Model = struct {
     var count: usize = 2;
     var query_fail: bool = false;
     var queries: usize = 0;
+    var registration: u64 = 0x1_0000_0055;
+    var generation: u64 = 0x2_0000_0055;
+    var registry: u64 = 7;
+    var invalid_metadata = false;
     fn info(index: u32, out: *a.AudioOutputInfo) callconv(.c) i32 {
         queries += 1;
         if (query_fail) return a.service_api_result_busy;
         if (index >= count) return 0;
         out.* = items[index]; return 1;
+    }
+    fn catalog(outputs: [*]a.AudioOutputInfo, capacity: u32, out: *a.AudioOutputCatalog) callconv(.c) i32 {
+        queries += 1;
+        std.debug.assert(capacity >= 256);
+        // A failed capture may already have overwritten caller scratch.
+        if (query_fail) {
+            outputs[0] = .{};
+            return a.service_api_result_busy;
+        }
+        @memcpy(outputs[0..count], items[0..count]);
+        out.* = .{ .registry_generation = registry, .count = @intCast(count), .provider_count = 1 };
+        out.providers[0] = .{ .registration = registration, .generation = generation, .count = if (invalid_metadata) 33 else @intCast(count), .active_index = -1 };
+        return 1;
     }
     fn select(id: *const [64]u8) callconv(.c) i32 {
         selections += 1;
@@ -34,8 +51,10 @@ pub fn check() !void {
     @memcpy(Model.items[1].name[0..7], "Hisense"); // Model data, no physical receiver claim.
     Model.selections = 0; Model.fail = false;
     Model.count = 2; Model.query_fail = false; Model.queries = 0;
+    Model.registration = 0x1_0000_0055; Model.generation = 0x2_0000_0055; Model.registry = 7; Model.invalid_metadata = false;
     var table: a.R4XStartR4Audio = .{};
     table.audio_output_info = @intFromPtr(&Model.info);
+    table.audio_output_catalog = @intFromPtr(&Model.catalog);
     table.audio_select_output = @intFromPtr(&Model.select);
     const raw: a.R4XStartContext = .{};
     const bundle: r4os.program.Bundle = .{ .raw = &raw, .audio = &table };
@@ -122,4 +141,32 @@ pub fn check() !void {
     Model.query_fail = false;
     try t.expect(state.refresh(&audio, 5501, 500, false));
     try t.expect(state.backendPresent());
+
+    // Identical rows under a new actual registration/provider epoch still
+    // require a new service publication identity. Never truncate u64 epochs.
+    const old_revision = state.revision;
+    Model.registration += 1; Model.registry += 1;
+    try t.expect(state.refresh(&audio, 6001, 500, false));
+    try t.expect(state.revision > old_revision);
+    const provider_revision = state.revision;
+    Model.generation += 1;
+    try t.expect(state.refresh(&audio, 6501, 500, false));
+    try t.expect(state.revision > provider_revision);
+    try t.expectEqual(Model.registration, state.catalog_epoch.providers[0].registration);
+    try t.expectEqual(Model.generation, state.catalog_epoch.providers[0].generation);
+    const retained = state.catalog;
+    const retained_epoch = state.catalog_epoch;
+    Model.invalid_metadata = true;
+    try t.expect(!state.refresh(&audio, 7001, 500, false));
+    try t.expect(!state.backendPresent());
+    try t.expectEqualDeep(retained, state.catalog);
+    try t.expectEqualDeep(retained_epoch, state.catalog_epoch);
+    Model.invalid_metadata = false;
+    Model.items[1].id = Model.items[0].id;
+    try t.expect(!state.refresh(&audio, 7501, 500, false));
+    try t.expectEqualDeep(retained, state.catalog);
+    table.audio_output_catalog = 0;
+    try t.expect(!state.refresh(&audio, 8001, 500, false));
+    try t.expectEqual(a.audio_output_reason_api_unavailable, state.reason);
+    try t.expect(!state.backendPresent());
 }
