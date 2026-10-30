@@ -59,7 +59,6 @@ const Session = struct {
     channels: u16 = 0,
     format: u16 = 0,
     fixed_volume: u32 = default_volume,
-    writes: u64 = 0,
     bytes_written: u64 = 0,
 };
 
@@ -436,7 +435,6 @@ fn writeSessionData(app: *const App, state: *AudioServiceState, session: *Sessio
         state.silence_bytes +%= @as(u64, @intCast(data.len));
         state.last_write_bytes = 0;
         copyFixed(state.last_error[0..], "silence-suppressed");
-        session.writes +%= 1;
         session.suppressed_bytes +%= data.len;
         return @intCast(data.len);
     }
@@ -467,7 +465,6 @@ fn writeSessionData(app: *const App, state: *AudioServiceState, session: *Sessio
         state.silence_write_count +%= 1;
         state.silence_bytes +%= bytes;
     }
-    session.writes +%= 1;
     session.bytes_written +%= @as(u64, bytes);
     state.bytes_written +%= @as(u64, bytes);
     state.last_write_bytes = bytes;
