@@ -4,13 +4,22 @@
 
 ## Package
 
-- Version: `0.1.21`
+- Version: `0.1.22`
 - Image target: `/R4OS/SERVICES/AUDSVC.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
 
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
+
+Version0.1.22 retires unrequested request-duration collection. Status and
+ordinary stream results set `audio_service_flag_duration_unavailable` and
+return `audio_duration_ticks_unavailable` (`UINT64_MAX`) in their six/two
+duration fields. This is unavailable data, never measured zero. Normal
+requests no longer take duration-only clock readings or update timing totals.
+The legacy Close keeps its entry tick and unchanged 500 ms deadline; the
+selection worker retains its exact-generation Join and request/client keys.
+Use SDK0.64.125 / Contract0.64.66 for the public flag name.
 
 Since version0.1.16 an active stream's zero PCM goes through its existing
 backend, preserving frame duration and identity. Initial unmaterialized

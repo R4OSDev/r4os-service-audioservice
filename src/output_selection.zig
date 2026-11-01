@@ -7,7 +7,6 @@ pub const Request = struct {
     client_id: u32,
     client_generation: u64,
     request_id: u32,
-    started: u64,
 };
 pub const Completion = struct {
     service_epoch: u64,
