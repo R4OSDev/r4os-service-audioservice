@@ -251,7 +251,7 @@ fn selectionLifecycle(audio: *const r4os.r4audio.Context, raw: *const a.R4XStart
     const bundle: r4os.program.Bundle = .{ .raw = raw, .sys = &sys_table };
     const sys = r4os.r4sys.Context.init(&bundle);
     var job: selection.Job = .{};
-    const request: selection.Request = .{ .client_id = 27, .client_generation = 0x3_0000_0056, .request_id = 28, .started = 31 };
+    const request: selection.Request = .{ .client_id = 27, .client_generation = 0x3_0000_0056, .request_id = 28 };
     const epoch: u64 = 0x4_0000_0056;
     JoinFixture.result = a.thread_error_timeout;
     JoinFixture.creates = 0;

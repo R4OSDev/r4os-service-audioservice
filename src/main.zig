@@ -7,6 +7,7 @@ const output_selection = @import("output_selection.zig");
 const session_ownership = @import("session_ownership.zig");
 const ClientInventory = session_ownership.ClientInventory;
 const pending_close = @import("pending_close.zig");
+const capture = @import("capture.zig");
 
 const service_name = "AUDSVC";
 const selftest_arg = "/SELFTEST";
@@ -32,6 +33,8 @@ var service_master_reply: r4os.abi.AudioServiceMasterState = .{};
 // The bounded catalog and scratch page belong to this service instance, not its stack.
 var service_outputs: output_control.State = .{};
 var service_output_selection: output_selection.Job = .{};
+var service_capture: capture.Manager = .{};
+var service_capture_reply: [@sizeOf(r4os.abi.AudioCaptureReply) + r4os.abi.audio_capture_max_read_bytes]u8 = .{0xA5} ** (@sizeOf(r4os.abi.AudioCaptureReply) + r4os.abi.audio_capture_max_read_bytes);
 
 const App = struct {
     sys: r4os.r4sys.Context,
@@ -159,13 +162,23 @@ fn runService(app: *const App) i32 {
         const now = app.sys.ticks();
         serviceOutputSelection(app, handle, &state, 0);
         serviceLegacyCloses(app, handle, &state);
+        var input_backend = capture.Backend{ .audio = &app.audio };
+        service_capture.maintenance(now, @max(app.sys.ticksFromMilliseconds(5), 1), &input_backend);
         serviceMasterPersistence(app, &state);
-        if (openSessionCount(&state) > 0 and now >= next_reap_tick) {
-            reapDisconnectedSessions(app, &state);
-            refreshBackendState(app, &state);
+        const active_output = openSessionCount(&state) > 0;
+        const active_input = service_capture.any();
+        if ((active_output or active_input) and now >= next_reap_tick) {
+            if (active_output) {
+                reapDisconnectedSessions(app, &state);
+                refreshBackendState(app, &state);
+            }
+            if (active_input) {
+                var reader = ClientInventory{ .ctx = &app.sys };
+                service_capture.reap(&input_backend, &reader);
+            }
             next_reap_tick = app.sys.ticks() +| reap_interval;
         }
-        var deadline: ?u64 = if (openSessionCount(&state) > 0) next_reap_tick else null;
+        var deadline: ?u64 = service_capture.deadline(if (active_output or active_input) next_reap_tick else null);
         if (state.persist_pending and !state.persistence.in_flight and
             (deadline == null or state.persist_due_tick < deadline.?))
         {
@@ -194,7 +207,13 @@ fn runService(app: *const App) i32 {
                 return rc;
             },
             .idle, .deadline => {},
-            .stop => break,
+            .stop => {
+                if (!service_capture.stopAll(&input_backend)) {
+                    app.sys.sleepTicks(1);
+                    continue;
+                }
+                break;
+            },
             .failure => |raw| {
                 cleanupService(app, handle, &state);
                 return raw;
@@ -218,6 +237,7 @@ fn handleRequest(app: *const App, handle: u32, state: *AudioServiceState) i32 {
     const payload_len: usize = @intCast(got);
     const payload = service_payload_buffer[0..payload_len];
     const rc = switch (header.op) {
+        r4os.abi.audio_capture_op_service => handleCapture(app, handle, header.request_id, header.client_id, payload),
         r4os.abi.audio_service_op_status => replyStatus(app, handle, header.request_id, state),
         r4os.abi.audio_service_op_set_master_volume => handleSetMasterVolume(app, handle, header.request_id, state, payload),
         r4os.abi.audio_service_op_outputs, r4os.abi.audio_service_op_select_output => handleOutputs(app, handle, header.request_id, header.client_id, state, header.op, payload),
@@ -235,6 +255,22 @@ fn handleRequest(app: *const App, handle: u32, state: *AudioServiceState) i32 {
         },
     };
     return rc;
+}
+
+fn handleCapture(app: *const App, handle: u32, request_id: u32, client_id: u32, payload: []const u8) i32 {
+    if (payload.len != @sizeOf(r4os.abi.AudioCaptureRequest)) return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_invalid, "");
+    const request = std.mem.bytesToValue(r4os.abi.AudioCaptureRequest, payload);
+    var client: r4os.abi.ProgramProcessHandle = .{};
+    var service: r4os.abi.ProgramProcessHandle = .{};
+    const own_id = std.math.cast(u32, app.instance_id) orelse return r4os.abi.service_api_result_invalid;
+    if (app.sys.programOpenHandle(client_id, &client) != r4os.abi.program_handle_ok or
+        client.generation != request.client_generation or app.sys.programOpenHandle(own_id, &service) != r4os.abi.program_handle_ok)
+        return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.audio_capture_error_stale, "");
+    var backend = capture.Backend{ .audio = &app.audio };
+    const head = @sizeOf(r4os.abi.AudioCaptureReply);
+    const reply = service_capture.handle(service, client, request, service_capture_reply[head..], app.sys.ticks(), app.sys.ticksFromMilliseconds(1000), &backend);
+    @memcpy(service_capture_reply[0..head], std.mem.asBytes(&reply));
+    return app.sys.serviceEndpointReply(handle, request_id, 0, service_capture_reply[0 .. head + reply.bytes]);
 }
 
 fn configurationSnapshot(state: *const AudioServiceState) master_control.Persisted {
@@ -324,6 +360,8 @@ fn serviceOutputSelection(app: *const App, handle: u32, state: *AudioServiceStat
 }
 
 fn cleanupService(app: *const App, handle: u32, state: *AudioServiceState) void {
+    var input_backend = capture.Backend{ .audio = &app.audio };
+    while (!service_capture.stopAll(&input_backend)) app.sys.sleepTicks(1);
     while (service_output_selection.in_flight) {
         serviceOutputSelection(app, handle, state, r4os.abi.io_wait_forever);
         if (service_output_selection.in_flight) app.sys.sleepTicks(1);

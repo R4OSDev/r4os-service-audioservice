@@ -132,3 +132,22 @@ aktive Null-PCM behaelt ihre Dauer und Backendidentitaet.
 Der integrierte Gast-Selbsttest belegt ausserdem Mute-Kompatibilitaet,
 gemeinsame Masterauffaecherung auf zwei Streams und Persistenz ueber einen
 Dienstneustart; danach stellt er den urspruenglichen Masterzustand wieder her.
+
+Optionale PCM-Aufnahme (AUDSVC0.1.23)
+------------------------------------
+Operation6100 bietet einen kopierten Capturekatalog und explizites
+Open/Read/Query/Stop/Close. Normativer Vertrag: Contract/API/AudioCapture.txt;
+SDK-Clients: audio_capture (Zig/Rust), audio_capture_platform2.h (C).
+Ohne qualifizierten R4D-Inputbackend bleibt Aufnahme ausdruecklich nicht
+verfuegbar. Playback, Encoder und HDA-Inputstreamzaehler belegen keinen ADC.
+Die ausgelieferten HDA-/AC97-Backends aktivieren hier keinen Audioeingang.
+
+Vier begrenzte Queues gehoeren ausschliesslich der urspruenglichen
+Dienstschleife. Die finale Caller-Puffergroesse wird vor Aktivierung/Entnahme
+geprueft; nur ganze S16LE-Frames werden kopiert. Quellgeneration, Overrun,
+Gap und unbekannte Hardwarezeitstempel bleiben explizit. Fehler bleiben nach
+einer spaeteren Stopquittung sichtbar. Cancel, Timeout und Channel-Disconnect
+geben keinen Capturestream oder Treiberpuffer frei. Erst echte Stop-/Close-
+Quittungen beenden den Besitzer; Kernel-Reap behaelt unquittierte Leihen.
+Die fuenf neuen Besitzerfaelle laufen im vorhandenen test-Schritt. Kontrollierter
+Input, Gasttransport und reale ADC-Hardware sind getrennte Nachweise.

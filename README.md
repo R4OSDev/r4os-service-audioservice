@@ -107,3 +107,19 @@ unsupported capture retains the last display while clearing its availability
 confirmation. Desired selection, fallback, NoEndpoint invalidation and the
 existing service epoch/revision page protocol remain in force. Physical route,
 ELD, Stop and DMA acknowledgements are separate observations.
+
+# Optional copied PCM input (AUDSVC0.1.23)
+
+Service operation6100 adds explicit Catalog/Open/Read/Query/Stop/Close over
+the original service loop. The separate immutable R4D input extension retains
+its DMA/backing until actual Stop/Close acknowledgements. Four bounded copied
+queues enforce the final caller capacity before activation or dequeue; complete
+S16LE frames carry exact source generations, gaps and overrun counts. Source
+failure remains a failure after a later Stop acknowledgement.
+
+Use the SDK audio_capture clients and the normative Contract/API/AudioCapture.txt.
+Without a qualified input extension, capability is explicitly unavailable.
+Shipped HDA/AC97 playback backends supply no qualified ADC; controlled input
+qualification does not establish microphone or physical DMA activity. Capture
+tests extend the existing test step. No recorder or application migration is
+included.
