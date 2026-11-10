@@ -41,11 +41,11 @@ const App = struct {
     audio: r4os.r4audio.Context,
     instance_id: u64,
 
-    fn init(r4_app: *r4os.App) ?App {
+    fn init(r4_app: *r4os.App2) ?App {
         return .{
             .sys = r4_app.system(),
             .audio = r4_app.audioLowLevel() orelse return null,
-            .instance_id = r4_app.raw.instance_id,
+            .instance_id = r4_app.context.raw.instance_id,
         };
     }
 };
@@ -121,7 +121,7 @@ const AudioServiceState = struct {
     last_error: [r4os.abi.audio_service_error_bytes]u8 = .{0} ** r4os.abi.audio_service_error_bytes,
 };
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
+pub fn r4_app_main(r4_app: *r4os.App2) i32 {
     var app = App.init(r4_app) orelse return r4os.abi.err_no_group;
     if (hasArg(app.sys.argsRaw(), selftest_arg)) return runSelfTest(&app);
     if (hasArg(app.sys.argsRaw(), ping_arg)) return runPing(&app);

@@ -9,18 +9,19 @@ pub const Page = struct { records: []const Record, complete: bool };
 
 pub const ClientInventory = struct {
     ctx: *const r4os.r4sys.Context,
-    cursor: abi.ProgramInventoryCursor = .{},
+    pages: ?r4os.inventory_reader.LifecyclePages = null,
     items: [16]abi.ProgramLifecycleSnapshot = undefined,
     records: [16]Record = undefined,
 
     pub fn begin(self: *ClientInventory) bool {
-        return self.ctx.programLifecycleBegin(&self.cursor) == abi.program_handle_ok;
+        const actual = self.ctx.base.generation2 orelse return false;
+        const provider = r4os.inventory_reader.fromContext2(actual, .lifecycle) catch return false;
+        self.pages = .{ .provider = provider };
+        return self.pages.?.begin();
     }
     pub fn next(self: *ClientInventory) ?Page {
-        var page: abi.ProgramInventoryPageInfo = .{};
-        if (self.ctx.programLifecyclePrograms(&self.cursor, &self.items, &page) != abi.program_handle_ok or
-            page.snapshot_generation != self.cursor.snapshot_generation or page.returned > self.items.len or
-            (page.status != abi.program_inventory_status_complete and page.status != abi.program_inventory_status_more)) return null;
+        const pages = if (self.pages) |*value| value else return null;
+        const page = pages.next(&self.items) orelse return null;
         for (self.items[0..page.returned], 0..) |item, i| {
             self.records[i] = .{
                 .owner = .{ .id = item.handle.instance_id, .generation = item.handle.generation },
@@ -133,9 +134,9 @@ test "one paged cleanup serves duplicate owners and rejects reused IDs and incom
 const NativeProbe = struct {
     const Mode = enum { normal, begin_busy, page_busy, restart, epoch, bounds, invalid, empty_more, empty_complete, second_busy, second_restart, more_live };
     var mode: Mode = .normal;
-    var table: abi.R4XStartR4Sys = .{};
-    var raw: abi.R4XStartContext = .{};
-    var bundle: r4os.program.Bundle = undefined;
+    var table: r4os.platform2.abi.R4XStartR4Sys2 = .{};
+    var raw: r4os.platform2.abi.R4XStartContext2 = .{};
+    var native: r4os.platform2.Context = undefined;
     var life_begins: usize = 0;
     var life_reads: usize = 0;
     var diagnostic_begins: usize = 0;
@@ -144,10 +145,10 @@ const NativeProbe = struct {
     const Row = struct { id: u32, generation: u64, state: u8 };
     const rows = [_]Row{
         .{ .id = 7, .generation = 11, .state = 0 },
-        .{ .id = 8, .generation = 99, .state = 0 },
         .{ .id = 9, .generation = 13, .state = 2 },
         .{ .id = 6, .generation = 17, .state = 0 },
         .{ .id = 10, .generation = 18, .state = 1 },
+        .{ .id = 8, .generation = 99, .state = 0 },
     };
     fn context(selected: Mode) r4os.r4sys.Context {
         mode = selected;
@@ -162,8 +163,8 @@ const NativeProbe = struct {
         table.program_lifecycle_programs = @intFromPtr(&lifePage);
         table.program_inventory_begin = @intFromPtr(&diagnosticBegin);
         table.program_inventory_programs = @intFromPtr(&diagnosticPage);
-        bundle = .{ .raw = &raw, .sys = &table };
-        return r4os.r4sys.Context.init(&bundle);
+        native = .{ .raw = &raw, .tables = .{ @intFromPtr(&table), 0, 0, 0, 0, 0 } };
+        return r4os.r4sys.Context.fromProgram(.{ .generation2 = &native });
     }
     fn begin(cursor: *abi.ProgramInventoryCursor, lifecycle: bool) i32 {
         if (mode == .begin_busy) return abi.program_handle_error_would_block;
@@ -185,9 +186,13 @@ const NativeProbe = struct {
         if (mode == .page_busy or ((mode == .second_busy or mode == .more_live) and pages == 2)) return abi.program_handle_error_would_block;
         out.* = .{ .snapshot_generation = cursor.snapshot_generation, .kind = kind, .total = rows.len, .returned = rows.len, .status = abi.program_inventory_status_complete };
         switch (mode) {
-            .restart => out.status = abi.program_inventory_status_restart,
+            .restart => {
+                out.status = abi.program_inventory_status_restart;
+                out.returned = 0;
+            },
             .second_restart => if (pages == 2) {
                 out.status = abi.program_inventory_status_restart;
+                out.returned = 0;
             },
             .epoch => out.snapshot_generation += 1,
             .bounds => out.returned = capacity + 1,
@@ -196,13 +201,17 @@ const NativeProbe = struct {
                 out.returned = 0;
                 out.status = abi.program_inventory_status_more;
             },
-            .empty_complete => out.returned = 0,
+            .empty_complete => {
+                out.returned = 0;
+                out.total = 0;
+            },
             else => {},
         }
         if ((mode == .second_busy or mode == .second_restart or mode == .more_live) and pages == 1) {
             out.returned = 1;
             out.status = abi.program_inventory_status_more;
         }
+        out.next_generation = cursor.program_after_generation;
         if (out.returned > 0 and out.returned <= capacity) {
             cursor.program_after_generation = rows[out.returned - 1].generation;
             out.next_generation = cursor.program_after_generation;

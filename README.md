@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.22`
+- Version: `0.1.24`
 - Image target: `/R4OS/SERVICES/AUDSVC.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -123,3 +123,7 @@ Shipped HDA/AC97 playback backends supply no qualified ADC; controlled input
 qualification does not establish microphone or physical DMA activity. Capture
 tests extend the existing test step. No recorder or application migration is
 included.
+
+## API migration 0.90.52
+
+The normal service uses App2/Start2 and actual R4SYS/R4AUDIO Query2:2 callbacks. Its lifecycle membership adapter uses the common SDK streaming page validator, preserving positive more-page evidence and complete-only absence, exact owner generations, WouldBlock rollback and explicit restart. Existing queued capture buffers, final caller capacity, output Work joins and separate Stop/Close acknowledgements remain with their original owners. HDA/AC97 still expose no ADC. Source-only pacing stays in source producers, not this dispatcher. SDK 0.64.193; independent resource-record revision1 remains distinct from the platform generation. Native, host-model and Windows compilation qualification are recorded separately in the R4OS ConsumerMigration report.
