@@ -1,10 +1,19 @@
-﻿AUDSVC.R4X 0.1.21
+﻿AUDSVC.R4X 0.1.26
 =================
 
 AUDSVC ist der clientgebundene Audio- und Mixer-Service zwischen der
 App-Audiofassade und dem gemeinsamen Kernel-Audiopfad. Das R4X-Modul wird aus
 `module.R4MF` gebaut, als Service gestartet und im Full-/Testimage unter
 `C:\R4OS\SERVICES\AUDSVC.R4X` installiert.
+
+Der ereignisgesteuerte Dispatcher fordert ueber sein genaues Threadhandle die
+vorhandene bevorzugte Arbeitsklasse an. Ein echter Kontextsave uebernimmt die
+Anforderung; anschliessend werden Klasse, Revision und ausstehender Zustand
+geprueft. Das Schedulerbudget bleibt auf vier Ticks und vier Dispatches je
+Aktivierung begrenzt. Die normale CPU-Zulassung und die Policies der getrennt
+gejointen Worker bleiben erhalten. Der Dispatcher erhaelt diese begrenzte
+Bevorzugung auch neben den Fernzugriffsdiensten. PCM, Transportfristen und
+echte Closequittungen bleiben erhalten.
 
 Streambesitz und Lazy-Lebenszyklus
 ----------------------------------

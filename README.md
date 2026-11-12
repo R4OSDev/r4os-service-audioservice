@@ -4,13 +4,21 @@
 
 ## Package
 
-- Version: `0.1.24`
+- Version: `0.1.26`
 - Image target: `/R4OS/SERVICES/AUDSVC.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
 
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
+
+The event-driven dispatcher requests the existing bounded preferred work class
+through its exact-generation thread handle and verifies adoption after a saved
+context boundary. The scheduler limits this preference to four ticks and four
+dispatches per activation. Default CPU admission and the policies of separately
+joined workers remain with their owners. The audio dispatcher receives this
+bounded preference alongside the remote services. PCM data, caller deadlines
+and terminal Close acknowledgements are preserved.
 
 Version0.1.22 retires unrequested request-duration collection. Status and
 ordinary stream results set `audio_service_flag_duration_unavailable` and
