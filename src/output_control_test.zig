@@ -79,11 +79,11 @@ pub fn check() !void {
     Model.generation = 0x2_0000_0055;
     Model.registry = 7;
     Model.invalid_metadata = false;
-    var table: a.R4XStartR4Audio = .{};
+    var table: @import("r4os").platform2.abi.R4XStartR4Audio2 = .{};
     table.audio_output_info = @intFromPtr(&Model.info);
     table.audio_output_catalog = @intFromPtr(&Model.catalog);
     table.audio_select_output = @intFromPtr(&Model.select);
-    const raw: a.R4XStartContext = .{};
+    const raw: @import("r4os").platform2.abi.R4XStartContext2 = .{};
     const bundle: r4os.program.Bundle = .{ .raw = &raw, .audio = &table };
     const audio = r4os.r4audio.Context.init(&bundle);
     var state: @import("output_control.zig").State = .{};
@@ -231,7 +231,7 @@ const JoinFixture = struct {
     }
 };
 
-fn selectionLifecycle(audio: *const r4os.r4audio.Context, raw: *const a.R4XStartContext) !void {
+fn selectionLifecycle(audio: *const r4os.r4audio.Context, raw: *const @import("r4os").platform2.abi.R4XStartContext2) !void {
     const control = @import("output_control.zig");
     const selection = @import("output_selection.zig");
     Model.items = .{ .{ .availability = a.audio_output_available, .kind = a.audio_output_kind_line_out, .flags = a.audio_output_flag_active }, .{ .availability = a.audio_output_available, .kind = a.audio_output_kind_hdmi } };
@@ -245,7 +245,7 @@ fn selectionLifecycle(audio: *const r4os.r4audio.Context, raw: *const a.R4XStart
     var operation = try state.prepare(Model.items[1].id, true);
     try t.expectEqual(@as(usize, 0), Model.selections);
     try t.expectEqual(@as(usize, 1), operation.count);
-    var sys_table: a.R4XStartR4Sys = .{};
+    var sys_table: @import("r4os").platform2.abi.R4XStartR4Sys2 = .{};
     sys_table.thread_create_handle = @intFromPtr(&JoinFixture.create);
     sys_table.thread_handle_join = @intFromPtr(&JoinFixture.join);
     const bundle: r4os.program.Bundle = .{ .raw = raw, .sys = &sys_table };
