@@ -111,16 +111,22 @@ const Backend = struct {
         return -1;
     }
 };
+fn deliver(m: *c.Manager, request: a.AudioCaptureRequest, bytes: []u8, now: u64, hz: u64, backend: *Backend) a.AudioCaptureReply {
+    var pending: c.PendingRead = .{};
+    const reply = m.prepare(service, client, request, bytes, now, hz, backend, &pending);
+    _ = pending.finish(a.service_api_result_ok);
+    return reply;
+}
 fn reserve(m: *c.Manager, b: *Backend, frames: u32) a.AudioCaptureReply {
-    return m.handle(service, client, .{ .op = a.audio_capture_op_open, .client_generation = client.generation, .handle = .{ .source = b.source().id }, .format = format, .queue_frames = frames }, &.{}, 0, 1000, b);
+    return deliver(m, .{ .op = a.audio_capture_op_open, .client_generation = client.generation, .handle = .{ .source = b.source().id }, .format = format, .queue_frames = frames }, &.{}, 0, 1000, b);
 }
 fn operation(m: *c.Manager, b: *Backend, id: a.AudioCaptureHandle, op: u32, frames: u32, bytes: []u8) a.AudioCaptureReply {
-    return m.handle(service, client, .{ .op = op, .client_generation = client.generation, .handle = id, .frames = frames, .buffer_bytes = if (op == a.audio_capture_op_read) @intCast(bytes.len) else 0 }, bytes, 1, 1000, b);
+    return deliver(m, .{ .op = op, .client_generation = client.generation, .handle = id, .frames = frames, .buffer_bytes = if (op == a.audio_capture_op_read) @intCast(bytes.len) else 0 }, bytes, 1, 1000, b);
 }
 test "capture availability and reservation expire without fabricated input or DMA" {
     var m: c.Manager = .{};
     var b: Backend = .{ .enabled = false };
-    var r = m.handle(service, client, .{ .client_generation = client.generation }, &.{}, 0, 1000, &b);
+    var r = deliver(&m, .{ .client_generation = client.generation }, &.{}, 0, 1000, &b);
     try std.testing.expectEqual(a.audio_capture_error_unsupported, r.result);
     try std.testing.expectEqual(@as(u32, 0), r.flags);
     try std.testing.expectEqual(a.audio_capture_error_unsupported, reserve(&m, &b, 4).result);
@@ -130,7 +136,7 @@ test "capture availability and reservation expire without fabricated input or DM
     try std.testing.expectEqual(@as(i32, 0), r.result);
     try std.testing.expect(r.state == a.audio_capture_state_reserved and b.opens == 0 and !b.held);
     var out: [16]u8 = .{0xA5} ** 16;
-    const expired = m.handle(service, client, .{ .op = a.audio_capture_op_read, .client_generation = client.generation, .handle = r.handle, .frames = 4, .buffer_bytes = out.len }, &out, 5000, 1000, &b);
+    const expired = deliver(&m, .{ .op = a.audio_capture_op_read, .client_generation = client.generation, .handle = r.handle, .frames = 4, .buffer_bytes = out.len }, &out, 5000, 1000, &b);
     try std.testing.expectEqual(a.audio_capture_error_stale, expired.result);
     try std.testing.expect(!m.any() and b.opens == 0 and !b.held);
     try std.testing.expectEqualSlices(u8, &(.{0xA5} ** 16), &out);
@@ -226,12 +232,12 @@ test "capture capacity caller generation and exhausted IDs reject before side ef
     // Real RPC handlers have a larger staging buffer than the caller. The
     // wire capacity must still reject before activation/dequeue.
     var staging: [2048]u8 = @splat(0xA5);
-    const wire = m.handle(service, client, .{ .op = a.audio_capture_op_read, .client_generation = client.generation, .handle = id, .frames = 2, .buffer_bytes = 7 }, &staging, 1, 1000, &b);
+    const wire = deliver(&m, .{ .op = a.audio_capture_op_read, .client_generation = client.generation, .handle = id, .frames = 2, .buffer_bytes = 7 }, &staging, 1, 1000, &b);
     try std.testing.expectEqual(a.audio_capture_error_capacity, wire.result);
     try std.testing.expect(b.opens == 0 and b.reads == 0 and !b.held);
     try std.testing.expectEqualSlices(u8, &(.{0xA5} ** 2048), &staging);
     try std.testing.expect(m.stopAll(&b));
-    const wrong = m.handle(service, client, .{ .op = a.audio_capture_op_open, .client_generation = client.generation + 1, .handle = .{ .source = b.source().id }, .format = format, .queue_frames = 4 }, &.{}, 0, 1000, &b);
+    const wrong = deliver(&m, .{ .op = a.audio_capture_op_open, .client_generation = client.generation + 1, .handle = .{ .source = b.source().id }, .format = format, .queue_frames = 4 }, &.{}, 0, 1000, &b);
     try std.testing.expectEqual(a.audio_capture_error_invalid, wrong.result);
     try std.testing.expect(!m.any());
     for (0..4) |_| try std.testing.expectEqual(@as(i32, 0), reserve(&m, &b, 4).result);
@@ -241,4 +247,56 @@ test "capture capacity caller generation and exhausted IDs reject before side ef
     m.next_generation = std.math.maxInt(u64);
     try std.testing.expectEqual(a.audio_capture_error_exhausted, reserve(&m, &b, 4).result);
     try std.testing.expect(!m.any());
+}
+
+test "SDK capture reads retain rejected frames and report only real ring loss" {
+    const Endpoint = struct {
+        var manager: c.Manager = .{};
+        var backend: Backend = .{ .hardware_timestamp = true };
+        var accept: bool = false;
+        fn call(_: u32, op: u16, input: [*]const u8, len: u32, header: *a.ServiceMessageHeader, output: [*]u8, capacity_out: u32, _: u64) callconv(.c) i32 {
+            const head = @sizeOf(a.AudioCaptureReply);
+            std.debug.assert(op == a.audio_capture_op_service and len == @sizeOf(a.AudioCaptureRequest));
+            const q = std.mem.bytesToValue(a.AudioCaptureRequest, input[0..@sizeOf(a.AudioCaptureRequest)]);
+            var pending: c.PendingRead = .{};
+            const reply = manager.prepare(service, client, q, output[head..capacity_out], 1, 1000, &backend, &pending);
+            const rc = pending.finish(if (accept) a.service_api_result_ok else a.service_api_result_not_found);
+            if (rc != 0) return rc;
+            header.* = .{ .status = 0 };
+            @memcpy(output[0..head], std.mem.asBytes(&reply));
+            return @intCast(head + reply.bytes);
+        }
+        fn close(_: u32) callconv(.c) i32 {
+            return 0;
+        }
+        fn clock(_: *a.MonotonicClockInfo) callconv(.c) i32 {
+            return 0;
+        }
+    };
+    const sdk: r4os.audio_capture.Client = .{ .call = Endpoint.call, .close_call = Endpoint.close, .clock = Endpoint.clock, .channel = 1, .client_generation = client.generation, .transport_ticks = 10 };
+    const id = reserve(&Endpoint.manager, &Endpoint.backend, 4).handle;
+    var pcm: [8]u8 = @splat(0xA5);
+    var reply: a.AudioCaptureReply = .{};
+    try std.testing.expectEqual(a.audio_capture_error_unknown_outcome, sdk.readPoll(id, 2, &pcm, &reply));
+    try std.testing.expectEqualSlices(u8, &(.{0xA5} ** 8), &pcm);
+    Endpoint.backend.would_block = true;
+    Endpoint.accept = true;
+    try std.testing.expectEqual(@as(i32, 0), sdk.readPoll(id, 2, &pcm, &reply));
+    try std.testing.expect(reply.first_frame == 0 and reply.frames == 2 and reply.queued_frames == 2 and reply.gap_frames == 0);
+    try std.testing.expect(reply.flags & a.audio_capture_reply_hardware_timestamp != 0);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 1, 1, 1, 1 }, &pcm);
+    Endpoint.accept = false;
+    try std.testing.expectEqual(a.audio_capture_error_unknown_outcome, sdk.readPoll(id, 2, &pcm, &reply));
+    Endpoint.backend.would_block = false;
+    Endpoint.manager.maintenance(4, 1, &Endpoint.backend);
+    Endpoint.backend.would_block = true;
+    Endpoint.accept = true;
+    try std.testing.expectEqual(@as(i32, 0), sdk.readPoll(id, 2, &pcm, &reply));
+    try std.testing.expect(reply.first_frame == 4 and reply.frames == 2 and reply.gap_frames == 2 and reply.overrun_frames == 2);
+    try std.testing.expect(reply.flags & a.audio_capture_reply_discontinuity != 0);
+    try std.testing.expectEqualSlices(u8, &.{ 4, 4, 4, 4, 5, 5, 5, 5 }, &pcm);
+    try std.testing.expectEqual(@as(i32, 0), sdk.readPoll(id, 2, &pcm, &reply));
+    try std.testing.expect(reply.first_frame == 6 and reply.frames == 2 and reply.gap_frames == 0 and reply.queued_frames == 0);
+    try std.testing.expectEqualSlices(u8, &.{ 6, 6, 6, 6, 7, 7, 7, 7 }, &pcm);
+    try std.testing.expect(Endpoint.manager.stopAll(&Endpoint.backend));
 }

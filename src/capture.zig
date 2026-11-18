@@ -32,6 +32,26 @@ const Slot = struct {
     // File-backed, initialized storage. Never lent to DMA or an IRQ producer.
     data: [capacity]u8 = .{0xA5} ** capacity,
 };
+// The service loop owns the slot until the endpoint reply returns.
+pub const PendingRead = struct {
+    slot: ?*Slot = null,
+    bytes: usize = 0,
+
+    pub fn finish(self: *PendingRead, transport_result: i32) i32 {
+        const slot = self.slot orelse return transport_result;
+        self.slot = null;
+        if (transport_result == a.service_api_result_ok) {
+            const width = slot.format.frame_bytes;
+            const limit = @as(usize, slot.queue_frames) * width;
+            slot.head = (slot.head + self.bytes) % limit;
+            slot.count -= self.bytes;
+            slot.first_frame += self.bytes / width;
+            slot.delivered_next = slot.first_frame;
+            slot.timestamp_valid = false;
+        }
+        return transport_result;
+    }
+};
 pub fn sameSource(x: a.AudioCaptureSourceId, y: a.AudioCaptureSourceId) bool {
     return std.meta.eql(x, y);
 }
@@ -226,7 +246,8 @@ pub const Manager = struct {
     }
     /// Caller supplies the full current service/client handles and disjoint
     /// output storage. This manager runs only on AUDSVC's original loop thread.
-    pub fn handle(self: *Manager, service: a.ProgramProcessHandle, client: a.ProgramProcessHandle, q: a.AudioCaptureRequest, bytes: []u8, now: u64, hz: u64, backend: anytype) a.AudioCaptureReply {
+    pub fn prepare(self: *Manager, service: a.ProgramProcessHandle, client: a.ProgramProcessHandle, q: a.AudioCaptureRequest, bytes: []u8, now: u64, hz: u64, backend: anytype, pending: *PendingRead) a.AudioCaptureReply {
+        pending.* = .{};
         if (q.version != 1 or q.size != @sizeOf(a.AudioCaptureRequest) or q.flags != 0 or q.buffer_bytes > read_bytes or (q.op != a.audio_capture_op_read and q.buffer_bytes != 0) or q.op > 5 or service.instance_id == 0 or service.generation == 0 or client.instance_id == 0 or client.generation == 0 or q.client_generation != client.generation or hz == 0 or bytes.len > read_bytes) return .{ .result = a.audio_capture_error_invalid };
         if (q.op == a.audio_capture_op_catalog) {
             if (q.handle.source.registration != 0 or q.handle.source.generation != 0) return .{ .result = a.audio_capture_error_invalid };
@@ -314,12 +335,8 @@ pub const Manager = struct {
         const first = @min(count, limit - s.head);
         @memcpy(bytes[0..first], s.data[s.head..][0..first]);
         @memcpy(bytes[first..count], s.data[0 .. count - first]);
-        s.head = (s.head + count) % limit;
-        s.count -= count;
-        s.first_frame += reply.frames;
-        s.delivered_next = s.first_frame;
-        s.timestamp_valid = false;
-        reply.queued_frames = @intCast(s.count / width);
+        reply.queued_frames = @intCast((s.count - count) / width);
+        pending.* = .{ .slot = s, .bytes = count };
         return reply;
     }
     pub fn maintenance(self: *Manager, now: u64, interval: u64, backend: anytype) void {

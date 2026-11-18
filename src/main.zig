@@ -298,9 +298,11 @@ fn handleCapture(app: *const App, handle: u32, request_id: u32, client_id: u32, 
         return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.audio_capture_error_stale, "");
     var backend = capture.Backend{ .audio = &app.audio };
     const head = @sizeOf(r4os.abi.AudioCaptureReply);
-    const reply = service_capture.handle(service, client, request, service_capture_reply[head..], app.sys.ticks(), app.sys.ticksFromMilliseconds(1000), &backend);
+    var pending: capture.PendingRead = .{};
+    const reply = service_capture.prepare(service, client, request, service_capture_reply[head..], app.sys.ticks(), app.sys.ticksFromMilliseconds(1000), &backend, &pending);
     @memcpy(service_capture_reply[0..head], std.mem.asBytes(&reply));
-    return app.sys.serviceEndpointReply(handle, request_id, 0, service_capture_reply[0 .. head + reply.bytes]);
+    const result = app.sys.serviceEndpointReply(handle, request_id, 0, service_capture_reply[0 .. head + reply.bytes]);
+    return pending.finish(result);
 }
 
 fn configurationSnapshot(state: *const AudioServiceState) master_control.Persisted {
